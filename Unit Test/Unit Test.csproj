@@ -1,0 +1,40 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <RootNamespace>Unit_Test</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="Nested Transactions.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+	  <PackageReference Include="DotNext.Threading" Version="5.20.0" />
+	  <PackageReference Include="Microsoft.AspNetCore.Authorization" Version="9.0.3" />
+	  <PackageReference Include="Microsoft.AspNetCore.Http" Version="2.3.0" />
+	  <PackageReference Include="Microsoft.AspNetCore.Mvc" Version="2.3.0" />
+	  <PackageReference Include="Microsoft.EntityFrameworkCore" Version="9.0.3" />
+	  <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="9.0.3" />
+	  <PackageReference Include="Microsoft.Extensions.Http" Version="9.0.3" />
+	  <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+	  <PackageReference Include="Moq" Version="4.20.72" />
+    <PackageReference Include="MSTest" Version="3.6.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Microsoft.VisualStudio.TestTools.UnitTesting" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="Fixture.xsd">
+      <SubType>Designer</SubType>
+      <LastGenOutput>Fixture.Designer.cs</LastGenOutput>
+      <Generator>DataModelGenerator</Generator>
+    </None>
+  </ItemGroup>
+
+</Project>

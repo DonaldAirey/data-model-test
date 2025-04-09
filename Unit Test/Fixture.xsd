@@ -1,0 +1,105 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<xs:schema id="Fixture" targetNamespace="http://tempuri.org/Fixture.xsd" xmlns="http://tempuri.org/Fixture.xsd" xmlns:mstns="http://tempuri.org/Fixture.xsd" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:gfdata="urn:schemas-gamma-four-com:xml-gfdata">
+	<xs:element name="Fixture">
+		<xs:complexType>
+			<xs:choice maxOccurs="unbounded">
+				<xs:element name="Account">
+					<xs:complexType>
+						<xs:sequence>
+							<xs:element name="AccountId" gfdata:dataType="System.Guid" type="xs:anyType" />
+							<xs:element name="Name">
+								<xs:simpleType>
+									<xs:restriction base="xs:string">
+										<xs:maxLength value="128" />
+									</xs:restriction>
+								</xs:simpleType>
+							</xs:element>
+						</xs:sequence>
+					</xs:complexType>
+				</xs:element>
+				<xs:element name="Asset">
+					<xs:complexType>
+						<xs:sequence>
+							<xs:element name="AssetId" gfdata:dataType="System.Guid" type="xs:anyType" />
+							<xs:element name="Name">
+								<xs:simpleType>
+									<xs:restriction base="xs:string">
+										<xs:maxLength value="128" />
+									</xs:restriction>
+								</xs:simpleType>
+							</xs:element>
+						</xs:sequence>
+					</xs:complexType>
+				</xs:element>
+				<xs:element name="Order">
+					<xs:complexType>
+						<xs:sequence>
+							<xs:element name="AccountId" gfdata:dataType="System.Guid" type="xs:anyType" />
+							<xs:element name="AssetId" gfdata:dataType="System.Guid" type="xs:anyType" />
+							<xs:element name="Quantity" type="xs:decimal" />
+						</xs:sequence>
+					</xs:complexType>
+				</xs:element>
+				<xs:element name="Position">
+					<xs:complexType>
+						<xs:sequence>
+							<xs:element name="AccountId" gfdata:dataType="System.Guid" type="xs:anyType" />
+							<xs:element name="AssetId" gfdata:dataType="System.Guid" type="xs:anyType" />
+							<xs:element name="Quantity" type="xs:decimal" />
+						</xs:sequence>
+					</xs:complexType>
+				</xs:element>
+				<xs:element name="Quote">
+					<xs:complexType>
+						<xs:sequence>
+							<xs:element name="AssetId" gfdata:dataType="System.Guid" type="xs:anyType" />
+							<xs:element name="Last" type="xs:decimal" />
+						</xs:sequence>
+					</xs:complexType>
+				</xs:element>
+			</xs:choice>
+		</xs:complexType>
+		<xs:unique name="AccountIndex" gfdata:isPrimaryIndex="true">
+			<xs:selector xpath=".//mstns:Account" />
+			<xs:field xpath="mstns:AccountId" />
+		</xs:unique>
+		<xs:unique name="AssetIndex" gfdata:isPrimaryIndex="true">
+			<xs:selector xpath=".//mstns:Asset" />
+			<xs:field xpath="mstns:AssetId" />
+		</xs:unique>
+		<xs:unique name="OrderIndex" gfdata:isPrimaryIndex="true">
+			<xs:selector xpath=".//mstns:Order" />
+			<xs:field xpath="mstns:AccountId" />
+			<xs:field xpath="mstns:AssetId" />
+		</xs:unique>
+		<xs:unique name="PositionIndex" gfdata:isPrimaryIndex="true">
+			<xs:selector xpath=".//mstns:Position" />
+			<xs:field xpath="mstns:AccountId" />
+			<xs:field xpath="mstns:AssetId" />
+		</xs:unique>
+		<xs:unique name="QuoteIndex" gfdata:isPrimaryIndex="true">
+			<xs:selector xpath=".//mstns:Quote" />
+			<xs:field xpath="mstns:AssetId" />
+		</xs:unique>
+		<xs:keyref name="AccountOrderIndex" refer="AccountIndex">
+			<xs:selector xpath=".//mstns:Order" />
+			<xs:field xpath="mstns:AccountId" />
+		</xs:keyref>
+		<xs:keyref name="AccountPositionIndex" refer="AccountIndex">
+			<xs:selector xpath=".//mstns:Position" />
+			<xs:field xpath="mstns:AccountId" />
+		</xs:keyref>
+		<xs:keyref name="AssetOrderIndex" refer="AssetIndex">
+			<xs:selector xpath=".//mstns:Order" />
+			<xs:field xpath="mstns:AssetId" />
+		</xs:keyref>
+		<xs:keyref name="AssetPositionIndex" refer="AssetIndex">
+			<xs:selector xpath=".//mstns:Position" />
+			<xs:field xpath="mstns:AssetId" />
+		</xs:keyref>
+		<xs:keyref name="AssetQuoteIndex" refer="AssetIndex">
+			<xs:selector xpath=".//mstns:Quote" />
+			<xs:field xpath="mstns:AssetId" />
+		</xs:keyref>
+	</xs:element>
+</xs:schema>
