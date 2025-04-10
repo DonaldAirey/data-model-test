@@ -172,6 +172,16 @@ namespace UnitTest
         /// <inheritdoc/>
         public void Dispose()
         {
+            foreach (var asyncReaderWriterLock in this.ReadLocks.Values)
+            {
+                asyncReaderWriterLock.Release();
+            }
+
+            foreach (var asyncReaderWriterLock in this.WriteLocks.Values)
+            {
+                asyncReaderWriterLock.Release();
+            }
+
             this.transactionScope.Dispose();
             AsyncTransaction.asyncTransaction.Value = null;
         }
@@ -209,16 +219,6 @@ namespace UnitTest
             if (this.cancellationTokenSource != null)
             {
                 this.cancellationTokenSource.Cancel();
-            }
-
-            foreach (var asyncReaderWriterLock in this.ReadLocks.Values)
-            {
-                asyncReaderWriterLock.Release();
-            }
-
-            foreach (var asyncReaderWriterLock in this.WriteLocks.Values)
-            {
-                asyncReaderWriterLock.Release();
             }
         }
     }
@@ -496,6 +496,11 @@ namespace UnitTest.Master
                     return null;
                 }
 
+                if (asyncTransaction.CancellationToken.IsCancellationRequested)
+                {
+                    throw new OperationCanceledException();
+                }
+
                 this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
                 return enlistmentState;
             }
@@ -516,9 +521,9 @@ namespace UnitTest.Master
             account.RowVersion = this.fixture.IncrementRowVersion();
             this.dictionary.Add(account.AccountId, account);
             enlistmentState.RollbackStack.Push(() => this.dictionary.Remove(account.AccountId));
-            var clone = new Account(account);
-            enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-            return clone;
+            var clonedRow = new Account(account);
+            enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+            return clonedRow;
         }
 
         /// <summary>
@@ -539,9 +544,9 @@ namespace UnitTest.Master
                 account.RowVersion = this.fixture.IncrementRowVersion();
                 this.dictionary.Add(account.AccountId, account);
                 enlistmentState.RollbackStack.Push(() => this.dictionary.Remove(account.AccountId));
-                var clone = new Account(account);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-                addedRows.Add(clone);
+                var clonedRow = new Account(account);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+                addedRows.Add(clonedRow);
             }
 
             return addedRows;
@@ -686,22 +691,22 @@ namespace UnitTest.Master
             var updatedRows = new List<Account>();
             foreach (var account in accounts)
             {
-                if (this.dictionary.TryGetValue(account.AccountId, out var updatedRow))
+                if (this.dictionary.TryGetValue(account.AccountId, out var foundRow))
                 {
-                    await updatedRow.EnterWriteLockAsync().ConfigureAwait(false);
-                    var originalRow = new Account(updatedRow);
-                    enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                    if (account.RowVersion != updatedRow.RowVersion)
+                    await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
+                    var originalRow = new Account(foundRow);
+                    enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                    if (account.RowVersion != foundRow.RowVersion)
                     {
                         throw new ConcurrencyException();
                     }
 
-                    updatedRow.AccountId = account.AccountId;
-                    updatedRow.Name = account.Name;
-                    updatedRow.RowVersion = this.fixture.IncrementRowVersion();
-                    var clone = new Account(updatedRow);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
-                    updatedRows.Add(clone);
+                    foundRow.AccountId = account.AccountId;
+                    foundRow.Name = account.Name;
+                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    var clonedRow = new Account(foundRow);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                    updatedRows.Add(clonedRow);
                 }
                 else
                 {
@@ -711,9 +716,9 @@ namespace UnitTest.Master
                     account.RowVersion = this.fixture.IncrementRowVersion();
                     this.dictionary.Add(account.AccountId, account);
                     enlistmentState.RollbackStack.Push(() => this.dictionary.Remove(account.AccountId));
-                    var clone = new Account(account);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-                    addedRows.Add(clone);
+                    var clonedRow = new Account(account);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+                    addedRows.Add(clonedRow);
                 }
             }
 
@@ -735,23 +740,22 @@ namespace UnitTest.Master
         {
             var enlistmentState = this.EnlistmentState;
             ArgumentNullException.ThrowIfNull(enlistmentState);
-            Account? addedRow = null;
-            if (this.dictionary.TryGetValue(account.AccountId, out var updatedRow))
+            if (this.dictionary.TryGetValue(account.AccountId, out var foundRow))
             {
-                await updatedRow.EnterWriteLockAsync().ConfigureAwait(false);
-                var originalRow = new Account(updatedRow);
-                enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                if (account.RowVersion != updatedRow.RowVersion)
+                await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
+                var originalRow = new Account(foundRow);
+                enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                if (account.RowVersion != foundRow.RowVersion)
                 {
                     throw new ConcurrencyException();
                 }
 
-                updatedRow.AccountId = account.AccountId;
-                updatedRow.Name = account.Name;
-                updatedRow.RowVersion = this.fixture.IncrementRowVersion();
-                var clone = new Account(updatedRow);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
-                updatedRow = clone;
+                foundRow.AccountId = account.AccountId;
+                foundRow.Name = account.Name;
+                foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                var clonedRow = new Account(foundRow);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                return (AddedRow: null, UpdatedRow: clonedRow);
             }
             else
             {
@@ -761,12 +765,10 @@ namespace UnitTest.Master
                 account.RowVersion = this.fixture.IncrementRowVersion();
                 this.dictionary.Add(account.AccountId, account);
                 enlistmentState.RollbackStack.Push(() => this.dictionary.Remove(account.AccountId));
-                var clone = new Account(account);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-                addedRow = account;
+                var clonedRow = new Account(account);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+                return (AddedRow: clonedRow, UpdatedRow: null);
             }
-
-            return (AddedRow: addedRow, UpdatedRow: updatedRow);
         }
 
         /// <summary>
@@ -781,41 +783,32 @@ namespace UnitTest.Master
             var removedRows = new List<Account>();
             foreach (var account in accounts)
             {
-                if (this.dictionary.TryGetValue(account.AccountId, out var removedRow))
+                if (this.dictionary.TryGetValue(account.AccountId, out var foundRow))
                 {
-                    await removedRow.EnterWriteLockAsync().ConfigureAwait(false);
-                    var originalRow = new Account(removedRow);
-                    enlistmentState.RollbackStack.Push(() => removedRow.CopyFrom(originalRow));
-                    if (removedRow.RowVersion != account.RowVersion)
+                    await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
+                    var originalRow = new Account(foundRow);
+                    enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                    if (foundRow.RowVersion != account.RowVersion)
                     {
                         throw new ConcurrencyException();
                     }
 
-                    if (removedRow.Orders.Any())
+                    if (foundRow.Orders.Any())
                     {
                         throw new ConstraintException("The remove action conflicted with the constraint AccountOrderIndex");
                     }
 
-                    if (removedRow.Positions.Any())
+                    if (foundRow.Positions.Any())
                     {
                         throw new ConstraintException("The remove action conflicted with the constraint AccountPositionIndex");
                     }
 
-                    removedRow.RowVersion = this.fixture.IncrementRowVersion();
-                    this.dictionary.Remove(removedRow.AccountId);
-                    enlistmentState.RollbackStack.Push(() => this.dictionary.Add(removedRow.AccountId, removedRow));
-                    var clone = new Account(removedRow);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clone));
-                    removedRow = clone;
-                }
-                else
-                {
-                    removedRow = null;
-                }
-
-                if (removedRow != null)
-                {
-                    removedRows.Add(removedRow);
+                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    this.dictionary.Remove(foundRow.AccountId);
+                    enlistmentState.RollbackStack.Push(() => this.dictionary.Add(foundRow.AccountId, foundRow));
+                    var clonedRow = new Account(foundRow);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clonedRow));
+                    removedRows.Add(clonedRow);
                 }
             }
 
@@ -831,39 +824,37 @@ namespace UnitTest.Master
         {
             var enlistmentState = this.EnlistmentState;
             ArgumentNullException.ThrowIfNull(enlistmentState);
-            if (this.dictionary.TryGetValue(account.AccountId, out var removedRow))
+            if (this.dictionary.TryGetValue(account.AccountId, out var foundRow))
             {
-                await removedRow.EnterWriteLockAsync().ConfigureAwait(false);
-                var originalRow = new Account(removedRow);
-                enlistmentState.RollbackStack.Push(() => removedRow.CopyFrom(originalRow));
-                if (removedRow.RowVersion != account.RowVersion)
+                await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
+                var originalRow = new Account(foundRow);
+                enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                if (foundRow.RowVersion != account.RowVersion)
                 {
                     throw new ConcurrencyException();
                 }
 
-                if (removedRow.Orders.Any())
+                if (foundRow.Orders.Any())
                 {
                     throw new ConstraintException("The remove action conflicted with the constraint AccountOrderIndex");
                 }
 
-                if (removedRow.Positions.Any())
+                if (foundRow.Positions.Any())
                 {
                     throw new ConstraintException("The remove action conflicted with the constraint AccountPositionIndex");
                 }
 
-                removedRow.RowVersion = this.fixture.IncrementRowVersion();
-                this.dictionary.Remove(removedRow.AccountId);
-                enlistmentState.RollbackStack.Push(() => this.dictionary.Add(removedRow.AccountId, removedRow));
-                var clone = new Account(removedRow);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clone));
-                removedRow = clone;
+                foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                this.dictionary.Remove(foundRow.AccountId);
+                enlistmentState.RollbackStack.Push(() => this.dictionary.Add(foundRow.AccountId, foundRow));
+                var clonedRow = new Account(foundRow);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clonedRow));
+                return clonedRow;
             }
             else
             {
-                removedRow = null;
+                return null;
             }
-
-            return removedRow;
         }
 
         /// <inheritdoc/>
@@ -894,28 +885,27 @@ namespace UnitTest.Master
             var updatedRows = new List<Account>();
             foreach (var account in accounts)
             {
-                if (this.dictionary.TryGetValue(account.AccountId, out var updatedRow))
+                if (this.dictionary.TryGetValue(account.AccountId, out var foundRow))
                 {
-                    await updatedRow.EnterWriteLockAsync().ConfigureAwait(false);
-                    var originalRow = new Account(updatedRow);
-                    enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                    if (account.RowVersion != updatedRow.RowVersion)
+                    await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
+                    var originalRow = new Account(foundRow);
+                    enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                    if (account.RowVersion != foundRow.RowVersion)
                     {
                         throw new ConcurrencyException();
                     }
 
-                    updatedRow.AccountId = account.AccountId;
-                    updatedRow.Name = account.Name;
-                    updatedRow.RowVersion = this.fixture.IncrementRowVersion();
-                    var clone = new Account(updatedRow);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
+                    foundRow.AccountId = account.AccountId;
+                    foundRow.Name = account.Name;
+                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    var clonedRow = new Account(foundRow);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                    updatedRows.Add(clonedRow);
                 }
                 else
                 {
                     throw new KeyNotFoundException();
                 }
-
-                updatedRows.Add(updatedRow);
             }
 
             return updatedRows;
@@ -929,29 +919,27 @@ namespace UnitTest.Master
         {
             var enlistmentState = this.EnlistmentState;
             ArgumentNullException.ThrowIfNull(enlistmentState);
-            if (this.dictionary.TryGetValue(account.AccountId, out var updatedRow))
+            if (this.dictionary.TryGetValue(account.AccountId, out var foundRow))
             {
-                await updatedRow.EnterWriteLockAsync().ConfigureAwait(false);
-                var originalRow = new Account(updatedRow);
-                enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                if (account.RowVersion != updatedRow.RowVersion)
+                await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
+                var originalRow = new Account(foundRow);
+                enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                if (account.RowVersion != foundRow.RowVersion)
                 {
                     throw new ConcurrencyException();
                 }
 
-                updatedRow.AccountId = account.AccountId;
-                updatedRow.Name = account.Name;
-                updatedRow.RowVersion = this.fixture.IncrementRowVersion();
-                var clone = new Account(updatedRow);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
-                updatedRow = clone;
+                foundRow.AccountId = account.AccountId;
+                foundRow.Name = account.Name;
+                foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                var clonedRow = new Account(foundRow);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                return clonedRow;
             }
             else
             {
                 throw new KeyNotFoundException();
             }
-
-            return updatedRow;
         }
     }
 
@@ -1466,6 +1454,11 @@ namespace UnitTest.Master
                     return null;
                 }
 
+                if (asyncTransaction.CancellationToken.IsCancellationRequested)
+                {
+                    throw new OperationCanceledException();
+                }
+
                 this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
                 return enlistmentState;
             }
@@ -1486,9 +1479,9 @@ namespace UnitTest.Master
             asset.RowVersion = this.fixture.IncrementRowVersion();
             this.dictionary.Add(asset.AssetId, asset);
             enlistmentState.RollbackStack.Push(() => this.dictionary.Remove(asset.AssetId));
-            var clone = new Asset(asset);
-            enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-            return clone;
+            var clonedRow = new Asset(asset);
+            enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+            return clonedRow;
         }
 
         /// <summary>
@@ -1509,9 +1502,9 @@ namespace UnitTest.Master
                 asset.RowVersion = this.fixture.IncrementRowVersion();
                 this.dictionary.Add(asset.AssetId, asset);
                 enlistmentState.RollbackStack.Push(() => this.dictionary.Remove(asset.AssetId));
-                var clone = new Asset(asset);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-                addedRows.Add(clone);
+                var clonedRow = new Asset(asset);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+                addedRows.Add(clonedRow);
             }
 
             return addedRows;
@@ -1656,22 +1649,22 @@ namespace UnitTest.Master
             var updatedRows = new List<Asset>();
             foreach (var asset in assets)
             {
-                if (this.dictionary.TryGetValue(asset.AssetId, out var updatedRow))
+                if (this.dictionary.TryGetValue(asset.AssetId, out var foundRow))
                 {
-                    await updatedRow.EnterWriteLockAsync().ConfigureAwait(false);
-                    var originalRow = new Asset(updatedRow);
-                    enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                    if (asset.RowVersion != updatedRow.RowVersion)
+                    await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
+                    var originalRow = new Asset(foundRow);
+                    enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                    if (asset.RowVersion != foundRow.RowVersion)
                     {
                         throw new ConcurrencyException();
                     }
 
-                    updatedRow.AssetId = asset.AssetId;
-                    updatedRow.Name = asset.Name;
-                    updatedRow.RowVersion = this.fixture.IncrementRowVersion();
-                    var clone = new Asset(updatedRow);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
-                    updatedRows.Add(clone);
+                    foundRow.AssetId = asset.AssetId;
+                    foundRow.Name = asset.Name;
+                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    var clonedRow = new Asset(foundRow);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                    updatedRows.Add(clonedRow);
                 }
                 else
                 {
@@ -1681,9 +1674,9 @@ namespace UnitTest.Master
                     asset.RowVersion = this.fixture.IncrementRowVersion();
                     this.dictionary.Add(asset.AssetId, asset);
                     enlistmentState.RollbackStack.Push(() => this.dictionary.Remove(asset.AssetId));
-                    var clone = new Asset(asset);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-                    addedRows.Add(clone);
+                    var clonedRow = new Asset(asset);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+                    addedRows.Add(clonedRow);
                 }
             }
 
@@ -1705,23 +1698,22 @@ namespace UnitTest.Master
         {
             var enlistmentState = this.EnlistmentState;
             ArgumentNullException.ThrowIfNull(enlistmentState);
-            Asset? addedRow = null;
-            if (this.dictionary.TryGetValue(asset.AssetId, out var updatedRow))
+            if (this.dictionary.TryGetValue(asset.AssetId, out var foundRow))
             {
-                await updatedRow.EnterWriteLockAsync().ConfigureAwait(false);
-                var originalRow = new Asset(updatedRow);
-                enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                if (asset.RowVersion != updatedRow.RowVersion)
+                await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
+                var originalRow = new Asset(foundRow);
+                enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                if (asset.RowVersion != foundRow.RowVersion)
                 {
                     throw new ConcurrencyException();
                 }
 
-                updatedRow.AssetId = asset.AssetId;
-                updatedRow.Name = asset.Name;
-                updatedRow.RowVersion = this.fixture.IncrementRowVersion();
-                var clone = new Asset(updatedRow);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
-                updatedRow = clone;
+                foundRow.AssetId = asset.AssetId;
+                foundRow.Name = asset.Name;
+                foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                var clonedRow = new Asset(foundRow);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                return (AddedRow: null, UpdatedRow: clonedRow);
             }
             else
             {
@@ -1731,12 +1723,10 @@ namespace UnitTest.Master
                 asset.RowVersion = this.fixture.IncrementRowVersion();
                 this.dictionary.Add(asset.AssetId, asset);
                 enlistmentState.RollbackStack.Push(() => this.dictionary.Remove(asset.AssetId));
-                var clone = new Asset(asset);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-                addedRow = asset;
+                var clonedRow = new Asset(asset);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+                return (AddedRow: clonedRow, UpdatedRow: null);
             }
-
-            return (AddedRow: addedRow, UpdatedRow: updatedRow);
         }
 
         /// <summary>
@@ -1751,46 +1741,37 @@ namespace UnitTest.Master
             var removedRows = new List<Asset>();
             foreach (var asset in assets)
             {
-                if (this.dictionary.TryGetValue(asset.AssetId, out var removedRow))
+                if (this.dictionary.TryGetValue(asset.AssetId, out var foundRow))
                 {
-                    await removedRow.EnterWriteLockAsync().ConfigureAwait(false);
-                    var originalRow = new Asset(removedRow);
-                    enlistmentState.RollbackStack.Push(() => removedRow.CopyFrom(originalRow));
-                    if (removedRow.RowVersion != asset.RowVersion)
+                    await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
+                    var originalRow = new Asset(foundRow);
+                    enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                    if (foundRow.RowVersion != asset.RowVersion)
                     {
                         throw new ConcurrencyException();
                     }
 
-                    if (removedRow.Orders.Any())
+                    if (foundRow.Orders.Any())
                     {
                         throw new ConstraintException("The remove action conflicted with the constraint AssetOrderIndex");
                     }
 
-                    if (removedRow.Positions.Any())
+                    if (foundRow.Positions.Any())
                     {
                         throw new ConstraintException("The remove action conflicted with the constraint AssetPositionIndex");
                     }
 
-                    if (removedRow.Quotes.Any())
+                    if (foundRow.Quotes.Any())
                     {
                         throw new ConstraintException("The remove action conflicted with the constraint AssetQuoteIndex");
                     }
 
-                    removedRow.RowVersion = this.fixture.IncrementRowVersion();
-                    this.dictionary.Remove(removedRow.AssetId);
-                    enlistmentState.RollbackStack.Push(() => this.dictionary.Add(removedRow.AssetId, removedRow));
-                    var clone = new Asset(removedRow);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clone));
-                    removedRow = clone;
-                }
-                else
-                {
-                    removedRow = null;
-                }
-
-                if (removedRow != null)
-                {
-                    removedRows.Add(removedRow);
+                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    this.dictionary.Remove(foundRow.AssetId);
+                    enlistmentState.RollbackStack.Push(() => this.dictionary.Add(foundRow.AssetId, foundRow));
+                    var clonedRow = new Asset(foundRow);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clonedRow));
+                    removedRows.Add(clonedRow);
                 }
             }
 
@@ -1806,44 +1787,42 @@ namespace UnitTest.Master
         {
             var enlistmentState = this.EnlistmentState;
             ArgumentNullException.ThrowIfNull(enlistmentState);
-            if (this.dictionary.TryGetValue(asset.AssetId, out var removedRow))
+            if (this.dictionary.TryGetValue(asset.AssetId, out var foundRow))
             {
-                await removedRow.EnterWriteLockAsync().ConfigureAwait(false);
-                var originalRow = new Asset(removedRow);
-                enlistmentState.RollbackStack.Push(() => removedRow.CopyFrom(originalRow));
-                if (removedRow.RowVersion != asset.RowVersion)
+                await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
+                var originalRow = new Asset(foundRow);
+                enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                if (foundRow.RowVersion != asset.RowVersion)
                 {
                     throw new ConcurrencyException();
                 }
 
-                if (removedRow.Orders.Any())
+                if (foundRow.Orders.Any())
                 {
                     throw new ConstraintException("The remove action conflicted with the constraint AssetOrderIndex");
                 }
 
-                if (removedRow.Positions.Any())
+                if (foundRow.Positions.Any())
                 {
                     throw new ConstraintException("The remove action conflicted with the constraint AssetPositionIndex");
                 }
 
-                if (removedRow.Quotes.Any())
+                if (foundRow.Quotes.Any())
                 {
                     throw new ConstraintException("The remove action conflicted with the constraint AssetQuoteIndex");
                 }
 
-                removedRow.RowVersion = this.fixture.IncrementRowVersion();
-                this.dictionary.Remove(removedRow.AssetId);
-                enlistmentState.RollbackStack.Push(() => this.dictionary.Add(removedRow.AssetId, removedRow));
-                var clone = new Asset(removedRow);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clone));
-                removedRow = clone;
+                foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                this.dictionary.Remove(foundRow.AssetId);
+                enlistmentState.RollbackStack.Push(() => this.dictionary.Add(foundRow.AssetId, foundRow));
+                var clonedRow = new Asset(foundRow);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clonedRow));
+                return clonedRow;
             }
             else
             {
-                removedRow = null;
+                return null;
             }
-
-            return removedRow;
         }
 
         /// <inheritdoc/>
@@ -1874,28 +1853,27 @@ namespace UnitTest.Master
             var updatedRows = new List<Asset>();
             foreach (var asset in assets)
             {
-                if (this.dictionary.TryGetValue(asset.AssetId, out var updatedRow))
+                if (this.dictionary.TryGetValue(asset.AssetId, out var foundRow))
                 {
-                    await updatedRow.EnterWriteLockAsync().ConfigureAwait(false);
-                    var originalRow = new Asset(updatedRow);
-                    enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                    if (asset.RowVersion != updatedRow.RowVersion)
+                    await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
+                    var originalRow = new Asset(foundRow);
+                    enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                    if (asset.RowVersion != foundRow.RowVersion)
                     {
                         throw new ConcurrencyException();
                     }
 
-                    updatedRow.AssetId = asset.AssetId;
-                    updatedRow.Name = asset.Name;
-                    updatedRow.RowVersion = this.fixture.IncrementRowVersion();
-                    var clone = new Asset(updatedRow);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
+                    foundRow.AssetId = asset.AssetId;
+                    foundRow.Name = asset.Name;
+                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    var clonedRow = new Asset(foundRow);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                    updatedRows.Add(clonedRow);
                 }
                 else
                 {
                     throw new KeyNotFoundException();
                 }
-
-                updatedRows.Add(updatedRow);
             }
 
             return updatedRows;
@@ -1909,29 +1887,27 @@ namespace UnitTest.Master
         {
             var enlistmentState = this.EnlistmentState;
             ArgumentNullException.ThrowIfNull(enlistmentState);
-            if (this.dictionary.TryGetValue(asset.AssetId, out var updatedRow))
+            if (this.dictionary.TryGetValue(asset.AssetId, out var foundRow))
             {
-                await updatedRow.EnterWriteLockAsync().ConfigureAwait(false);
-                var originalRow = new Asset(updatedRow);
-                enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                if (asset.RowVersion != updatedRow.RowVersion)
+                await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
+                var originalRow = new Asset(foundRow);
+                enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                if (asset.RowVersion != foundRow.RowVersion)
                 {
                     throw new ConcurrencyException();
                 }
 
-                updatedRow.AssetId = asset.AssetId;
-                updatedRow.Name = asset.Name;
-                updatedRow.RowVersion = this.fixture.IncrementRowVersion();
-                var clone = new Asset(updatedRow);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
-                updatedRow = clone;
+                foundRow.AssetId = asset.AssetId;
+                foundRow.Name = asset.Name;
+                foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                var clonedRow = new Asset(foundRow);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                return clonedRow;
             }
             else
             {
                 throw new KeyNotFoundException();
             }
-
-            return updatedRow;
         }
     }
 
@@ -2631,6 +2607,11 @@ namespace UnitTest.Master
                     return null;
                 }
 
+                if (asyncTransaction.CancellationToken.IsCancellationRequested)
+                {
+                    throw new OperationCanceledException();
+                }
+
                 this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
                 return enlistmentState;
             }
@@ -2671,9 +2652,9 @@ namespace UnitTest.Master
             order.RowVersion = this.fixture.IncrementRowVersion();
             this.dictionary.Add((order.AccountId, order.AssetId), order);
             enlistmentState.RollbackStack.Push(() => this.dictionary.Remove((order.AccountId, order.AssetId)));
-            var clone = new Order(order);
-            enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-            return clone;
+            var clonedRow = new Order(order);
+            enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+            return clonedRow;
         }
 
         /// <summary>
@@ -2714,9 +2695,9 @@ namespace UnitTest.Master
                 order.RowVersion = this.fixture.IncrementRowVersion();
                 this.dictionary.Add((order.AccountId, order.AssetId), order);
                 enlistmentState.RollbackStack.Push(() => this.dictionary.Remove((order.AccountId, order.AssetId)));
-                var clone = new Order(order);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-                addedRows.Add(clone);
+                var clonedRow = new Order(order);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+                addedRows.Add(clonedRow);
             }
 
             return addedRows;
@@ -2878,23 +2859,23 @@ namespace UnitTest.Master
             var updatedRows = new List<Order>();
             foreach (var order in orders)
             {
-                if (this.dictionary.TryGetValue((order.AccountId, order.AssetId), out var updatedRow))
+                if (this.dictionary.TryGetValue((order.AccountId, order.AssetId), out var foundRow))
                 {
-                    await updatedRow.EnterWriteLockAsync().ConfigureAwait(false);
-                    var originalRow = new Order(updatedRow);
-                    enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                    if (order.RowVersion != updatedRow.RowVersion)
+                    await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
+                    var originalRow = new Order(foundRow);
+                    enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                    if (order.RowVersion != foundRow.RowVersion)
                     {
                         throw new ConcurrencyException();
                     }
 
-                    updatedRow.AccountId = order.AccountId;
-                    updatedRow.AssetId = order.AssetId;
-                    updatedRow.Quantity = order.Quantity;
-                    updatedRow.RowVersion = this.fixture.IncrementRowVersion();
-                    var clone = new Order(updatedRow);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
-                    updatedRows.Add(clone);
+                    foundRow.AccountId = order.AccountId;
+                    foundRow.AssetId = order.AssetId;
+                    foundRow.Quantity = order.Quantity;
+                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    var clonedRow = new Order(foundRow);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                    updatedRows.Add(clonedRow);
                 }
                 else
                 {
@@ -2924,9 +2905,9 @@ namespace UnitTest.Master
                     order.RowVersion = this.fixture.IncrementRowVersion();
                     this.dictionary.Add((order.AccountId, order.AssetId), order);
                     enlistmentState.RollbackStack.Push(() => this.dictionary.Remove((order.AccountId, order.AssetId)));
-                    var clone = new Order(order);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-                    addedRows.Add(clone);
+                    var clonedRow = new Order(order);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+                    addedRows.Add(clonedRow);
                 }
             }
 
@@ -2948,24 +2929,23 @@ namespace UnitTest.Master
         {
             var enlistmentState = this.EnlistmentState;
             ArgumentNullException.ThrowIfNull(enlistmentState);
-            Order? addedRow = null;
-            if (this.dictionary.TryGetValue((order.AccountId, order.AssetId), out var updatedRow))
+            if (this.dictionary.TryGetValue((order.AccountId, order.AssetId), out var foundRow))
             {
-                await updatedRow.EnterWriteLockAsync().ConfigureAwait(false);
-                var originalRow = new Order(updatedRow);
-                enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                if (order.RowVersion != updatedRow.RowVersion)
+                await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
+                var originalRow = new Order(foundRow);
+                enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                if (order.RowVersion != foundRow.RowVersion)
                 {
                     throw new ConcurrencyException();
                 }
 
-                updatedRow.AccountId = order.AccountId;
-                updatedRow.AssetId = order.AssetId;
-                updatedRow.Quantity = order.Quantity;
-                updatedRow.RowVersion = this.fixture.IncrementRowVersion();
-                var clone = new Order(updatedRow);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
-                updatedRow = clone;
+                foundRow.AccountId = order.AccountId;
+                foundRow.AssetId = order.AssetId;
+                foundRow.Quantity = order.Quantity;
+                foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                var clonedRow = new Order(foundRow);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                return (AddedRow: null, UpdatedRow: clonedRow);
             }
             else
             {
@@ -2995,12 +2975,10 @@ namespace UnitTest.Master
                 order.RowVersion = this.fixture.IncrementRowVersion();
                 this.dictionary.Add((order.AccountId, order.AssetId), order);
                 enlistmentState.RollbackStack.Push(() => this.dictionary.Remove((order.AccountId, order.AssetId)));
-                var clone = new Order(order);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-                addedRow = order;
+                var clonedRow = new Order(order);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+                return (AddedRow: clonedRow, UpdatedRow: null);
             }
-
-            return (AddedRow: addedRow, UpdatedRow: updatedRow);
         }
 
         /// <summary>
@@ -3015,12 +2993,12 @@ namespace UnitTest.Master
             var removedRows = new List<Order>();
             foreach (var order in orders)
             {
-                if (this.dictionary.TryGetValue((order.AccountId, order.AssetId), out var removedRow))
+                if (this.dictionary.TryGetValue((order.AccountId, order.AssetId), out var foundRow))
                 {
-                    await removedRow.EnterWriteLockAsync().ConfigureAwait(false);
-                    var originalRow = new Order(removedRow);
-                    enlistmentState.RollbackStack.Push(() => removedRow.CopyFrom(originalRow));
-                    if (removedRow.RowVersion != order.RowVersion)
+                    await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
+                    var originalRow = new Order(foundRow);
+                    enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                    if (foundRow.RowVersion != order.RowVersion)
                     {
                         throw new ConcurrencyException();
                     }
@@ -3037,21 +3015,12 @@ namespace UnitTest.Master
                     oldAsset.Orders.Remove(order);
                     enlistmentState.RollbackStack.Push(() => oldAsset.Orders.Add(order));
                     order.Asset = null;
-                    removedRow.RowVersion = this.fixture.IncrementRowVersion();
-                    this.dictionary.Remove((removedRow.AccountId, removedRow.AssetId));
-                    enlistmentState.RollbackStack.Push(() => this.dictionary.Add((removedRow.AccountId, removedRow.AssetId), removedRow));
-                    var clone = new Order(removedRow);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clone));
-                    removedRow = clone;
-                }
-                else
-                {
-                    removedRow = null;
-                }
-
-                if (removedRow != null)
-                {
-                    removedRows.Add(removedRow);
+                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    this.dictionary.Remove((foundRow.AccountId, foundRow.AssetId));
+                    enlistmentState.RollbackStack.Push(() => this.dictionary.Add((foundRow.AccountId, foundRow.AssetId), foundRow));
+                    var clonedRow = new Order(foundRow);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clonedRow));
+                    removedRows.Add(clonedRow);
                 }
             }
 
@@ -3067,12 +3036,12 @@ namespace UnitTest.Master
         {
             var enlistmentState = this.EnlistmentState;
             ArgumentNullException.ThrowIfNull(enlistmentState);
-            if (this.dictionary.TryGetValue((order.AccountId, order.AssetId), out var removedRow))
+            if (this.dictionary.TryGetValue((order.AccountId, order.AssetId), out var foundRow))
             {
-                await removedRow.EnterWriteLockAsync().ConfigureAwait(false);
-                var originalRow = new Order(removedRow);
-                enlistmentState.RollbackStack.Push(() => removedRow.CopyFrom(originalRow));
-                if (removedRow.RowVersion != order.RowVersion)
+                await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
+                var originalRow = new Order(foundRow);
+                enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                if (foundRow.RowVersion != order.RowVersion)
                 {
                     throw new ConcurrencyException();
                 }
@@ -3089,19 +3058,17 @@ namespace UnitTest.Master
                 oldAsset.Orders.Remove(order);
                 enlistmentState.RollbackStack.Push(() => oldAsset.Orders.Add(order));
                 order.Asset = null;
-                removedRow.RowVersion = this.fixture.IncrementRowVersion();
-                this.dictionary.Remove((removedRow.AccountId, removedRow.AssetId));
-                enlistmentState.RollbackStack.Push(() => this.dictionary.Add((removedRow.AccountId, removedRow.AssetId), removedRow));
-                var clone = new Order(removedRow);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clone));
-                removedRow = clone;
+                foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                this.dictionary.Remove((foundRow.AccountId, foundRow.AssetId));
+                enlistmentState.RollbackStack.Push(() => this.dictionary.Add((foundRow.AccountId, foundRow.AssetId), foundRow));
+                var clonedRow = new Order(foundRow);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clonedRow));
+                return clonedRow;
             }
             else
             {
-                removedRow = null;
+                return null;
             }
-
-            return removedRow;
         }
 
         /// <inheritdoc/>
@@ -3132,29 +3099,28 @@ namespace UnitTest.Master
             var updatedRows = new List<Order>();
             foreach (var order in orders)
             {
-                if (this.dictionary.TryGetValue((order.AccountId, order.AssetId), out var updatedRow))
+                if (this.dictionary.TryGetValue((order.AccountId, order.AssetId), out var foundRow))
                 {
-                    await updatedRow.EnterWriteLockAsync().ConfigureAwait(false);
-                    var originalRow = new Order(updatedRow);
-                    enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                    if (order.RowVersion != updatedRow.RowVersion)
+                    await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
+                    var originalRow = new Order(foundRow);
+                    enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                    if (order.RowVersion != foundRow.RowVersion)
                     {
                         throw new ConcurrencyException();
                     }
 
-                    updatedRow.AccountId = order.AccountId;
-                    updatedRow.AssetId = order.AssetId;
-                    updatedRow.Quantity = order.Quantity;
-                    updatedRow.RowVersion = this.fixture.IncrementRowVersion();
-                    var clone = new Order(updatedRow);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
+                    foundRow.AccountId = order.AccountId;
+                    foundRow.AssetId = order.AssetId;
+                    foundRow.Quantity = order.Quantity;
+                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    var clonedRow = new Order(foundRow);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                    updatedRows.Add(clonedRow);
                 }
                 else
                 {
                     throw new KeyNotFoundException();
                 }
-
-                updatedRows.Add(updatedRow);
             }
 
             return updatedRows;
@@ -3168,30 +3134,28 @@ namespace UnitTest.Master
         {
             var enlistmentState = this.EnlistmentState;
             ArgumentNullException.ThrowIfNull(enlistmentState);
-            if (this.dictionary.TryGetValue((order.AccountId, order.AssetId), out var updatedRow))
+            if (this.dictionary.TryGetValue((order.AccountId, order.AssetId), out var foundRow))
             {
-                await updatedRow.EnterWriteLockAsync().ConfigureAwait(false);
-                var originalRow = new Order(updatedRow);
-                enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                if (order.RowVersion != updatedRow.RowVersion)
+                await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
+                var originalRow = new Order(foundRow);
+                enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                if (order.RowVersion != foundRow.RowVersion)
                 {
                     throw new ConcurrencyException();
                 }
 
-                updatedRow.AccountId = order.AccountId;
-                updatedRow.AssetId = order.AssetId;
-                updatedRow.Quantity = order.Quantity;
-                updatedRow.RowVersion = this.fixture.IncrementRowVersion();
-                var clone = new Order(updatedRow);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
-                updatedRow = clone;
+                foundRow.AccountId = order.AccountId;
+                foundRow.AssetId = order.AssetId;
+                foundRow.Quantity = order.Quantity;
+                foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                var clonedRow = new Order(foundRow);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                return clonedRow;
             }
             else
             {
                 throw new KeyNotFoundException();
             }
-
-            return updatedRow;
         }
     }
 
@@ -3708,6 +3672,11 @@ namespace UnitTest.Master
                     return null;
                 }
 
+                if (asyncTransaction.CancellationToken.IsCancellationRequested)
+                {
+                    throw new OperationCanceledException();
+                }
+
                 this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
                 return enlistmentState;
             }
@@ -3748,9 +3717,9 @@ namespace UnitTest.Master
             position.RowVersion = this.fixture.IncrementRowVersion();
             this.dictionary.Add((position.AccountId, position.AssetId), position);
             enlistmentState.RollbackStack.Push(() => this.dictionary.Remove((position.AccountId, position.AssetId)));
-            var clone = new Position(position);
-            enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-            return clone;
+            var clonedRow = new Position(position);
+            enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+            return clonedRow;
         }
 
         /// <summary>
@@ -3791,9 +3760,9 @@ namespace UnitTest.Master
                 position.RowVersion = this.fixture.IncrementRowVersion();
                 this.dictionary.Add((position.AccountId, position.AssetId), position);
                 enlistmentState.RollbackStack.Push(() => this.dictionary.Remove((position.AccountId, position.AssetId)));
-                var clone = new Position(position);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-                addedRows.Add(clone);
+                var clonedRow = new Position(position);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+                addedRows.Add(clonedRow);
             }
 
             return addedRows;
@@ -3955,23 +3924,23 @@ namespace UnitTest.Master
             var updatedRows = new List<Position>();
             foreach (var position in positions)
             {
-                if (this.dictionary.TryGetValue((position.AccountId, position.AssetId), out var updatedRow))
+                if (this.dictionary.TryGetValue((position.AccountId, position.AssetId), out var foundRow))
                 {
-                    await updatedRow.EnterWriteLockAsync().ConfigureAwait(false);
-                    var originalRow = new Position(updatedRow);
-                    enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                    if (position.RowVersion != updatedRow.RowVersion)
+                    await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
+                    var originalRow = new Position(foundRow);
+                    enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                    if (position.RowVersion != foundRow.RowVersion)
                     {
                         throw new ConcurrencyException();
                     }
 
-                    updatedRow.AccountId = position.AccountId;
-                    updatedRow.AssetId = position.AssetId;
-                    updatedRow.Quantity = position.Quantity;
-                    updatedRow.RowVersion = this.fixture.IncrementRowVersion();
-                    var clone = new Position(updatedRow);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
-                    updatedRows.Add(clone);
+                    foundRow.AccountId = position.AccountId;
+                    foundRow.AssetId = position.AssetId;
+                    foundRow.Quantity = position.Quantity;
+                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    var clonedRow = new Position(foundRow);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                    updatedRows.Add(clonedRow);
                 }
                 else
                 {
@@ -4001,9 +3970,9 @@ namespace UnitTest.Master
                     position.RowVersion = this.fixture.IncrementRowVersion();
                     this.dictionary.Add((position.AccountId, position.AssetId), position);
                     enlistmentState.RollbackStack.Push(() => this.dictionary.Remove((position.AccountId, position.AssetId)));
-                    var clone = new Position(position);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-                    addedRows.Add(clone);
+                    var clonedRow = new Position(position);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+                    addedRows.Add(clonedRow);
                 }
             }
 
@@ -4025,24 +3994,23 @@ namespace UnitTest.Master
         {
             var enlistmentState = this.EnlistmentState;
             ArgumentNullException.ThrowIfNull(enlistmentState);
-            Position? addedRow = null;
-            if (this.dictionary.TryGetValue((position.AccountId, position.AssetId), out var updatedRow))
+            if (this.dictionary.TryGetValue((position.AccountId, position.AssetId), out var foundRow))
             {
-                await updatedRow.EnterWriteLockAsync().ConfigureAwait(false);
-                var originalRow = new Position(updatedRow);
-                enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                if (position.RowVersion != updatedRow.RowVersion)
+                await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
+                var originalRow = new Position(foundRow);
+                enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                if (position.RowVersion != foundRow.RowVersion)
                 {
                     throw new ConcurrencyException();
                 }
 
-                updatedRow.AccountId = position.AccountId;
-                updatedRow.AssetId = position.AssetId;
-                updatedRow.Quantity = position.Quantity;
-                updatedRow.RowVersion = this.fixture.IncrementRowVersion();
-                var clone = new Position(updatedRow);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
-                updatedRow = clone;
+                foundRow.AccountId = position.AccountId;
+                foundRow.AssetId = position.AssetId;
+                foundRow.Quantity = position.Quantity;
+                foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                var clonedRow = new Position(foundRow);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                return (AddedRow: null, UpdatedRow: clonedRow);
             }
             else
             {
@@ -4072,12 +4040,10 @@ namespace UnitTest.Master
                 position.RowVersion = this.fixture.IncrementRowVersion();
                 this.dictionary.Add((position.AccountId, position.AssetId), position);
                 enlistmentState.RollbackStack.Push(() => this.dictionary.Remove((position.AccountId, position.AssetId)));
-                var clone = new Position(position);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-                addedRow = position;
+                var clonedRow = new Position(position);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+                return (AddedRow: clonedRow, UpdatedRow: null);
             }
-
-            return (AddedRow: addedRow, UpdatedRow: updatedRow);
         }
 
         /// <summary>
@@ -4092,12 +4058,12 @@ namespace UnitTest.Master
             var removedRows = new List<Position>();
             foreach (var position in positions)
             {
-                if (this.dictionary.TryGetValue((position.AccountId, position.AssetId), out var removedRow))
+                if (this.dictionary.TryGetValue((position.AccountId, position.AssetId), out var foundRow))
                 {
-                    await removedRow.EnterWriteLockAsync().ConfigureAwait(false);
-                    var originalRow = new Position(removedRow);
-                    enlistmentState.RollbackStack.Push(() => removedRow.CopyFrom(originalRow));
-                    if (removedRow.RowVersion != position.RowVersion)
+                    await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
+                    var originalRow = new Position(foundRow);
+                    enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                    if (foundRow.RowVersion != position.RowVersion)
                     {
                         throw new ConcurrencyException();
                     }
@@ -4114,21 +4080,12 @@ namespace UnitTest.Master
                     oldAsset.Positions.Remove(position);
                     enlistmentState.RollbackStack.Push(() => oldAsset.Positions.Add(position));
                     position.Asset = null;
-                    removedRow.RowVersion = this.fixture.IncrementRowVersion();
-                    this.dictionary.Remove((removedRow.AccountId, removedRow.AssetId));
-                    enlistmentState.RollbackStack.Push(() => this.dictionary.Add((removedRow.AccountId, removedRow.AssetId), removedRow));
-                    var clone = new Position(removedRow);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clone));
-                    removedRow = clone;
-                }
-                else
-                {
-                    removedRow = null;
-                }
-
-                if (removedRow != null)
-                {
-                    removedRows.Add(removedRow);
+                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    this.dictionary.Remove((foundRow.AccountId, foundRow.AssetId));
+                    enlistmentState.RollbackStack.Push(() => this.dictionary.Add((foundRow.AccountId, foundRow.AssetId), foundRow));
+                    var clonedRow = new Position(foundRow);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clonedRow));
+                    removedRows.Add(clonedRow);
                 }
             }
 
@@ -4144,12 +4101,12 @@ namespace UnitTest.Master
         {
             var enlistmentState = this.EnlistmentState;
             ArgumentNullException.ThrowIfNull(enlistmentState);
-            if (this.dictionary.TryGetValue((position.AccountId, position.AssetId), out var removedRow))
+            if (this.dictionary.TryGetValue((position.AccountId, position.AssetId), out var foundRow))
             {
-                await removedRow.EnterWriteLockAsync().ConfigureAwait(false);
-                var originalRow = new Position(removedRow);
-                enlistmentState.RollbackStack.Push(() => removedRow.CopyFrom(originalRow));
-                if (removedRow.RowVersion != position.RowVersion)
+                await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
+                var originalRow = new Position(foundRow);
+                enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                if (foundRow.RowVersion != position.RowVersion)
                 {
                     throw new ConcurrencyException();
                 }
@@ -4166,19 +4123,17 @@ namespace UnitTest.Master
                 oldAsset.Positions.Remove(position);
                 enlistmentState.RollbackStack.Push(() => oldAsset.Positions.Add(position));
                 position.Asset = null;
-                removedRow.RowVersion = this.fixture.IncrementRowVersion();
-                this.dictionary.Remove((removedRow.AccountId, removedRow.AssetId));
-                enlistmentState.RollbackStack.Push(() => this.dictionary.Add((removedRow.AccountId, removedRow.AssetId), removedRow));
-                var clone = new Position(removedRow);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clone));
-                removedRow = clone;
+                foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                this.dictionary.Remove((foundRow.AccountId, foundRow.AssetId));
+                enlistmentState.RollbackStack.Push(() => this.dictionary.Add((foundRow.AccountId, foundRow.AssetId), foundRow));
+                var clonedRow = new Position(foundRow);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clonedRow));
+                return clonedRow;
             }
             else
             {
-                removedRow = null;
+                return null;
             }
-
-            return removedRow;
         }
 
         /// <inheritdoc/>
@@ -4209,29 +4164,28 @@ namespace UnitTest.Master
             var updatedRows = new List<Position>();
             foreach (var position in positions)
             {
-                if (this.dictionary.TryGetValue((position.AccountId, position.AssetId), out var updatedRow))
+                if (this.dictionary.TryGetValue((position.AccountId, position.AssetId), out var foundRow))
                 {
-                    await updatedRow.EnterWriteLockAsync().ConfigureAwait(false);
-                    var originalRow = new Position(updatedRow);
-                    enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                    if (position.RowVersion != updatedRow.RowVersion)
+                    await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
+                    var originalRow = new Position(foundRow);
+                    enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                    if (position.RowVersion != foundRow.RowVersion)
                     {
                         throw new ConcurrencyException();
                     }
 
-                    updatedRow.AccountId = position.AccountId;
-                    updatedRow.AssetId = position.AssetId;
-                    updatedRow.Quantity = position.Quantity;
-                    updatedRow.RowVersion = this.fixture.IncrementRowVersion();
-                    var clone = new Position(updatedRow);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
+                    foundRow.AccountId = position.AccountId;
+                    foundRow.AssetId = position.AssetId;
+                    foundRow.Quantity = position.Quantity;
+                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    var clonedRow = new Position(foundRow);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                    updatedRows.Add(clonedRow);
                 }
                 else
                 {
                     throw new KeyNotFoundException();
                 }
-
-                updatedRows.Add(updatedRow);
             }
 
             return updatedRows;
@@ -4245,30 +4199,28 @@ namespace UnitTest.Master
         {
             var enlistmentState = this.EnlistmentState;
             ArgumentNullException.ThrowIfNull(enlistmentState);
-            if (this.dictionary.TryGetValue((position.AccountId, position.AssetId), out var updatedRow))
+            if (this.dictionary.TryGetValue((position.AccountId, position.AssetId), out var foundRow))
             {
-                await updatedRow.EnterWriteLockAsync().ConfigureAwait(false);
-                var originalRow = new Position(updatedRow);
-                enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                if (position.RowVersion != updatedRow.RowVersion)
+                await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
+                var originalRow = new Position(foundRow);
+                enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                if (position.RowVersion != foundRow.RowVersion)
                 {
                     throw new ConcurrencyException();
                 }
 
-                updatedRow.AccountId = position.AccountId;
-                updatedRow.AssetId = position.AssetId;
-                updatedRow.Quantity = position.Quantity;
-                updatedRow.RowVersion = this.fixture.IncrementRowVersion();
-                var clone = new Position(updatedRow);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
-                updatedRow = clone;
+                foundRow.AccountId = position.AccountId;
+                foundRow.AssetId = position.AssetId;
+                foundRow.Quantity = position.Quantity;
+                foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                var clonedRow = new Position(foundRow);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                return clonedRow;
             }
             else
             {
                 throw new KeyNotFoundException();
             }
-
-            return updatedRow;
         }
     }
 
@@ -4769,6 +4721,11 @@ namespace UnitTest.Master
                     return null;
                 }
 
+                if (asyncTransaction.CancellationToken.IsCancellationRequested)
+                {
+                    throw new OperationCanceledException();
+                }
+
                 this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
                 return enlistmentState;
             }
@@ -4799,9 +4756,9 @@ namespace UnitTest.Master
             quote.RowVersion = this.fixture.IncrementRowVersion();
             this.dictionary.Add(quote.AssetId, quote);
             enlistmentState.RollbackStack.Push(() => this.dictionary.Remove(quote.AssetId));
-            var clone = new Quote(quote);
-            enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-            return clone;
+            var clonedRow = new Quote(quote);
+            enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+            return clonedRow;
         }
 
         /// <summary>
@@ -4832,9 +4789,9 @@ namespace UnitTest.Master
                 quote.RowVersion = this.fixture.IncrementRowVersion();
                 this.dictionary.Add(quote.AssetId, quote);
                 enlistmentState.RollbackStack.Push(() => this.dictionary.Remove(quote.AssetId));
-                var clone = new Quote(quote);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-                addedRows.Add(clone);
+                var clonedRow = new Quote(quote);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+                addedRows.Add(clonedRow);
             }
 
             return addedRows;
@@ -4987,22 +4944,22 @@ namespace UnitTest.Master
             var updatedRows = new List<Quote>();
             foreach (var quote in quotes)
             {
-                if (this.dictionary.TryGetValue(quote.AssetId, out var updatedRow))
+                if (this.dictionary.TryGetValue(quote.AssetId, out var foundRow))
                 {
-                    await updatedRow.EnterWriteLockAsync().ConfigureAwait(false);
-                    var originalRow = new Quote(updatedRow);
-                    enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                    if (quote.RowVersion != updatedRow.RowVersion)
+                    await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
+                    var originalRow = new Quote(foundRow);
+                    enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                    if (quote.RowVersion != foundRow.RowVersion)
                     {
                         throw new ConcurrencyException();
                     }
 
-                    updatedRow.AssetId = quote.AssetId;
-                    updatedRow.Last = quote.Last;
-                    updatedRow.RowVersion = this.fixture.IncrementRowVersion();
-                    var clone = new Quote(updatedRow);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
-                    updatedRows.Add(clone);
+                    foundRow.AssetId = quote.AssetId;
+                    foundRow.Last = quote.Last;
+                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    var clonedRow = new Quote(foundRow);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                    updatedRows.Add(clonedRow);
                 }
                 else
                 {
@@ -5022,9 +4979,9 @@ namespace UnitTest.Master
                     quote.RowVersion = this.fixture.IncrementRowVersion();
                     this.dictionary.Add(quote.AssetId, quote);
                     enlistmentState.RollbackStack.Push(() => this.dictionary.Remove(quote.AssetId));
-                    var clone = new Quote(quote);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-                    addedRows.Add(clone);
+                    var clonedRow = new Quote(quote);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+                    addedRows.Add(clonedRow);
                 }
             }
 
@@ -5046,23 +5003,22 @@ namespace UnitTest.Master
         {
             var enlistmentState = this.EnlistmentState;
             ArgumentNullException.ThrowIfNull(enlistmentState);
-            Quote? addedRow = null;
-            if (this.dictionary.TryGetValue(quote.AssetId, out var updatedRow))
+            if (this.dictionary.TryGetValue(quote.AssetId, out var foundRow))
             {
-                await updatedRow.EnterWriteLockAsync().ConfigureAwait(false);
-                var originalRow = new Quote(updatedRow);
-                enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                if (quote.RowVersion != updatedRow.RowVersion)
+                await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
+                var originalRow = new Quote(foundRow);
+                enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                if (quote.RowVersion != foundRow.RowVersion)
                 {
                     throw new ConcurrencyException();
                 }
 
-                updatedRow.AssetId = quote.AssetId;
-                updatedRow.Last = quote.Last;
-                updatedRow.RowVersion = this.fixture.IncrementRowVersion();
-                var clone = new Quote(updatedRow);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
-                updatedRow = clone;
+                foundRow.AssetId = quote.AssetId;
+                foundRow.Last = quote.Last;
+                foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                var clonedRow = new Quote(foundRow);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                return (AddedRow: null, UpdatedRow: clonedRow);
             }
             else
             {
@@ -5082,12 +5038,10 @@ namespace UnitTest.Master
                 quote.RowVersion = this.fixture.IncrementRowVersion();
                 this.dictionary.Add(quote.AssetId, quote);
                 enlistmentState.RollbackStack.Push(() => this.dictionary.Remove(quote.AssetId));
-                var clone = new Quote(quote);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-                addedRow = quote;
+                var clonedRow = new Quote(quote);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+                return (AddedRow: clonedRow, UpdatedRow: null);
             }
-
-            return (AddedRow: addedRow, UpdatedRow: updatedRow);
         }
 
         /// <summary>
@@ -5102,12 +5056,12 @@ namespace UnitTest.Master
             var removedRows = new List<Quote>();
             foreach (var quote in quotes)
             {
-                if (this.dictionary.TryGetValue(quote.AssetId, out var removedRow))
+                if (this.dictionary.TryGetValue(quote.AssetId, out var foundRow))
                 {
-                    await removedRow.EnterWriteLockAsync().ConfigureAwait(false);
-                    var originalRow = new Quote(removedRow);
-                    enlistmentState.RollbackStack.Push(() => removedRow.CopyFrom(originalRow));
-                    if (removedRow.RowVersion != quote.RowVersion)
+                    await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
+                    var originalRow = new Quote(foundRow);
+                    enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                    if (foundRow.RowVersion != quote.RowVersion)
                     {
                         throw new ConcurrencyException();
                     }
@@ -5118,21 +5072,12 @@ namespace UnitTest.Master
                     oldAsset.Quotes.Remove(quote);
                     enlistmentState.RollbackStack.Push(() => oldAsset.Quotes.Add(quote));
                     quote.Asset = null;
-                    removedRow.RowVersion = this.fixture.IncrementRowVersion();
-                    this.dictionary.Remove(removedRow.AssetId);
-                    enlistmentState.RollbackStack.Push(() => this.dictionary.Add(removedRow.AssetId, removedRow));
-                    var clone = new Quote(removedRow);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clone));
-                    removedRow = clone;
-                }
-                else
-                {
-                    removedRow = null;
-                }
-
-                if (removedRow != null)
-                {
-                    removedRows.Add(removedRow);
+                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    this.dictionary.Remove(foundRow.AssetId);
+                    enlistmentState.RollbackStack.Push(() => this.dictionary.Add(foundRow.AssetId, foundRow));
+                    var clonedRow = new Quote(foundRow);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clonedRow));
+                    removedRows.Add(clonedRow);
                 }
             }
 
@@ -5148,12 +5093,12 @@ namespace UnitTest.Master
         {
             var enlistmentState = this.EnlistmentState;
             ArgumentNullException.ThrowIfNull(enlistmentState);
-            if (this.dictionary.TryGetValue(quote.AssetId, out var removedRow))
+            if (this.dictionary.TryGetValue(quote.AssetId, out var foundRow))
             {
-                await removedRow.EnterWriteLockAsync().ConfigureAwait(false);
-                var originalRow = new Quote(removedRow);
-                enlistmentState.RollbackStack.Push(() => removedRow.CopyFrom(originalRow));
-                if (removedRow.RowVersion != quote.RowVersion)
+                await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
+                var originalRow = new Quote(foundRow);
+                enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                if (foundRow.RowVersion != quote.RowVersion)
                 {
                     throw new ConcurrencyException();
                 }
@@ -5164,19 +5109,17 @@ namespace UnitTest.Master
                 oldAsset.Quotes.Remove(quote);
                 enlistmentState.RollbackStack.Push(() => oldAsset.Quotes.Add(quote));
                 quote.Asset = null;
-                removedRow.RowVersion = this.fixture.IncrementRowVersion();
-                this.dictionary.Remove(removedRow.AssetId);
-                enlistmentState.RollbackStack.Push(() => this.dictionary.Add(removedRow.AssetId, removedRow));
-                var clone = new Quote(removedRow);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clone));
-                removedRow = clone;
+                foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                this.dictionary.Remove(foundRow.AssetId);
+                enlistmentState.RollbackStack.Push(() => this.dictionary.Add(foundRow.AssetId, foundRow));
+                var clonedRow = new Quote(foundRow);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clonedRow));
+                return clonedRow;
             }
             else
             {
-                removedRow = null;
+                return null;
             }
-
-            return removedRow;
         }
 
         /// <inheritdoc/>
@@ -5207,28 +5150,27 @@ namespace UnitTest.Master
             var updatedRows = new List<Quote>();
             foreach (var quote in quotes)
             {
-                if (this.dictionary.TryGetValue(quote.AssetId, out var updatedRow))
+                if (this.dictionary.TryGetValue(quote.AssetId, out var foundRow))
                 {
-                    await updatedRow.EnterWriteLockAsync().ConfigureAwait(false);
-                    var originalRow = new Quote(updatedRow);
-                    enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                    if (quote.RowVersion != updatedRow.RowVersion)
+                    await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
+                    var originalRow = new Quote(foundRow);
+                    enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                    if (quote.RowVersion != foundRow.RowVersion)
                     {
                         throw new ConcurrencyException();
                     }
 
-                    updatedRow.AssetId = quote.AssetId;
-                    updatedRow.Last = quote.Last;
-                    updatedRow.RowVersion = this.fixture.IncrementRowVersion();
-                    var clone = new Quote(updatedRow);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
+                    foundRow.AssetId = quote.AssetId;
+                    foundRow.Last = quote.Last;
+                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    var clonedRow = new Quote(foundRow);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                    updatedRows.Add(clonedRow);
                 }
                 else
                 {
                     throw new KeyNotFoundException();
                 }
-
-                updatedRows.Add(updatedRow);
             }
 
             return updatedRows;
@@ -5242,29 +5184,27 @@ namespace UnitTest.Master
         {
             var enlistmentState = this.EnlistmentState;
             ArgumentNullException.ThrowIfNull(enlistmentState);
-            if (this.dictionary.TryGetValue(quote.AssetId, out var updatedRow))
+            if (this.dictionary.TryGetValue(quote.AssetId, out var foundRow))
             {
-                await updatedRow.EnterWriteLockAsync().ConfigureAwait(false);
-                var originalRow = new Quote(updatedRow);
-                enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                if (quote.RowVersion != updatedRow.RowVersion)
+                await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
+                var originalRow = new Quote(foundRow);
+                enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                if (quote.RowVersion != foundRow.RowVersion)
                 {
                     throw new ConcurrencyException();
                 }
 
-                updatedRow.AssetId = quote.AssetId;
-                updatedRow.Last = quote.Last;
-                updatedRow.RowVersion = this.fixture.IncrementRowVersion();
-                var clone = new Quote(updatedRow);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
-                updatedRow = clone;
+                foundRow.AssetId = quote.AssetId;
+                foundRow.Last = quote.Last;
+                foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                var clonedRow = new Quote(foundRow);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                return clonedRow;
             }
             else
             {
                 throw new KeyNotFoundException();
             }
-
-            return updatedRow;
         }
     }
 
@@ -5791,6 +5731,11 @@ namespace UnitTest.Slave
                     return null;
                 }
 
+                if (asyncTransaction.CancellationToken.IsCancellationRequested)
+                {
+                    throw new OperationCanceledException();
+                }
+
                 this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
                 return enlistmentState;
             }
@@ -5811,9 +5756,9 @@ namespace UnitTest.Slave
             this.fixture.RowVersion = account.RowVersion;
             this.dictionary.Add(account.AccountId, account);
             enlistmentState.RollbackStack.Push(() => this.dictionary.Remove(account.AccountId));
-            var clone = new Account(account);
-            enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-            return clone;
+            var clonedRow = new Account(account);
+            enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+            return clonedRow;
         }
 
         /// <summary>
@@ -5834,9 +5779,9 @@ namespace UnitTest.Slave
                 this.fixture.RowVersion = account.RowVersion;
                 this.dictionary.Add(account.AccountId, account);
                 enlistmentState.RollbackStack.Push(() => this.dictionary.Remove(account.AccountId));
-                var clone = new Account(account);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-                addedRows.Add(clone);
+                var clonedRow = new Account(account);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+                addedRows.Add(clonedRow);
             }
 
             return addedRows;
@@ -5981,17 +5926,17 @@ namespace UnitTest.Slave
             var updatedRows = new List<Account>();
             foreach (var account in accounts)
             {
-                if (this.dictionary.TryGetValue(account.AccountId, out var updatedRow))
+                if (this.dictionary.TryGetValue(account.AccountId, out var foundRow))
                 {
-                    await updatedRow.EnterWriteLockAsync().ConfigureAwait(true);
-                    var originalRow = new Account(updatedRow);
-                    enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                    updatedRow.AccountId = account.AccountId;
-                    updatedRow.Name = account.Name;
+                    await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
+                    var originalRow = new Account(foundRow);
+                    enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                    foundRow.AccountId = account.AccountId;
+                    foundRow.Name = account.Name;
                     this.fixture.RowVersion = account.RowVersion;
-                    var clone = new Account(updatedRow);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
-                    updatedRows.Add(clone);
+                    var clonedRow = new Account(foundRow);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                    updatedRows.Add(clonedRow);
                 }
                 else
                 {
@@ -6001,9 +5946,9 @@ namespace UnitTest.Slave
                     this.fixture.RowVersion = account.RowVersion;
                     this.dictionary.Add(account.AccountId, account);
                     enlistmentState.RollbackStack.Push(() => this.dictionary.Remove(account.AccountId));
-                    var clone = new Account(account);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-                    addedRows.Add(clone);
+                    var clonedRow = new Account(account);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+                    addedRows.Add(clonedRow);
                 }
             }
 
@@ -6025,18 +5970,17 @@ namespace UnitTest.Slave
         {
             var enlistmentState = this.EnlistmentState;
             ArgumentNullException.ThrowIfNull(enlistmentState);
-            Account? addedRow = null;
-            if (this.dictionary.TryGetValue(account.AccountId, out var updatedRow))
+            if (this.dictionary.TryGetValue(account.AccountId, out var foundRow))
             {
-                await updatedRow.EnterWriteLockAsync().ConfigureAwait(true);
-                var originalRow = new Account(updatedRow);
-                enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                updatedRow.AccountId = account.AccountId;
-                updatedRow.Name = account.Name;
+                await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
+                var originalRow = new Account(foundRow);
+                enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                foundRow.AccountId = account.AccountId;
+                foundRow.Name = account.Name;
                 this.fixture.RowVersion = account.RowVersion;
-                var clone = new Account(updatedRow);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
-                updatedRow = clone;
+                var clonedRow = new Account(foundRow);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                return (AddedRow: null, UpdatedRow: clonedRow);
             }
             else
             {
@@ -6046,12 +5990,10 @@ namespace UnitTest.Slave
                 this.fixture.RowVersion = account.RowVersion;
                 this.dictionary.Add(account.AccountId, account);
                 enlistmentState.RollbackStack.Push(() => this.dictionary.Remove(account.AccountId));
-                var clone = new Account(account);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-                addedRow = account;
+                var clonedRow = new Account(account);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+                return (AddedRow: clonedRow, UpdatedRow: null);
             }
-
-            return (AddedRow: addedRow, UpdatedRow: updatedRow);
         }
 
         /// <summary>
@@ -6066,36 +6008,27 @@ namespace UnitTest.Slave
             var removedRows = new List<Account>();
             foreach (var account in accounts)
             {
-                if (this.dictionary.TryGetValue(account.AccountId, out var removedRow))
+                if (this.dictionary.TryGetValue(account.AccountId, out var foundRow))
                 {
-                    await removedRow.EnterWriteLockAsync().ConfigureAwait(true);
-                    var originalRow = new Account(removedRow);
-                    enlistmentState.RollbackStack.Push(() => removedRow.CopyFrom(originalRow));
-                    if (removedRow.Orders.Any())
+                    await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
+                    var originalRow = new Account(foundRow);
+                    enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                    if (foundRow.Orders.Any())
                     {
                         throw new ConstraintException("The remove action conflicted with the constraint AccountOrderIndex");
                     }
 
-                    if (removedRow.Positions.Any())
+                    if (foundRow.Positions.Any())
                     {
                         throw new ConstraintException("The remove action conflicted with the constraint AccountPositionIndex");
                     }
 
-                    this.fixture.RowVersion = removedRow.RowVersion;
-                    this.dictionary.Remove(removedRow.AccountId);
-                    enlistmentState.RollbackStack.Push(() => this.dictionary.Add(removedRow.AccountId, removedRow));
-                    var clone = new Account(removedRow);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clone));
-                    removedRow = clone;
-                }
-                else
-                {
-                    removedRow = null;
-                }
-
-                if (removedRow != null)
-                {
-                    removedRows.Add(removedRow);
+                    this.fixture.RowVersion = foundRow.RowVersion;
+                    this.dictionary.Remove(foundRow.AccountId);
+                    enlistmentState.RollbackStack.Push(() => this.dictionary.Add(foundRow.AccountId, foundRow));
+                    var clonedRow = new Account(foundRow);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clonedRow));
+                    removedRows.Add(clonedRow);
                 }
             }
 
@@ -6111,34 +6044,32 @@ namespace UnitTest.Slave
         {
             var enlistmentState = this.EnlistmentState;
             ArgumentNullException.ThrowIfNull(enlistmentState);
-            if (this.dictionary.TryGetValue(account.AccountId, out var removedRow))
+            if (this.dictionary.TryGetValue(account.AccountId, out var foundRow))
             {
-                await removedRow.EnterWriteLockAsync().ConfigureAwait(true);
-                var originalRow = new Account(removedRow);
-                enlistmentState.RollbackStack.Push(() => removedRow.CopyFrom(originalRow));
-                if (removedRow.Orders.Any())
+                await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
+                var originalRow = new Account(foundRow);
+                enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                if (foundRow.Orders.Any())
                 {
                     throw new ConstraintException("The remove action conflicted with the constraint AccountOrderIndex");
                 }
 
-                if (removedRow.Positions.Any())
+                if (foundRow.Positions.Any())
                 {
                     throw new ConstraintException("The remove action conflicted with the constraint AccountPositionIndex");
                 }
 
-                this.fixture.RowVersion = removedRow.RowVersion;
-                this.dictionary.Remove(removedRow.AccountId);
-                enlistmentState.RollbackStack.Push(() => this.dictionary.Add(removedRow.AccountId, removedRow));
-                var clone = new Account(removedRow);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clone));
-                removedRow = clone;
+                this.fixture.RowVersion = foundRow.RowVersion;
+                this.dictionary.Remove(foundRow.AccountId);
+                enlistmentState.RollbackStack.Push(() => this.dictionary.Add(foundRow.AccountId, foundRow));
+                var clonedRow = new Account(foundRow);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clonedRow));
+                return clonedRow;
             }
             else
             {
-                removedRow = null;
+                return null;
             }
-
-            return removedRow;
         }
 
         /// <inheritdoc/>
@@ -6169,23 +6100,22 @@ namespace UnitTest.Slave
             var updatedRows = new List<Account>();
             foreach (var account in accounts)
             {
-                if (this.dictionary.TryGetValue(account.AccountId, out var updatedRow))
+                if (this.dictionary.TryGetValue(account.AccountId, out var foundRow))
                 {
-                    await updatedRow.EnterWriteLockAsync().ConfigureAwait(true);
-                    var originalRow = new Account(updatedRow);
-                    enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                    updatedRow.AccountId = account.AccountId;
-                    updatedRow.Name = account.Name;
+                    await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
+                    var originalRow = new Account(foundRow);
+                    enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                    foundRow.AccountId = account.AccountId;
+                    foundRow.Name = account.Name;
                     this.fixture.RowVersion = account.RowVersion;
-                    var clone = new Account(updatedRow);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
+                    var clonedRow = new Account(foundRow);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                    updatedRows.Add(clonedRow);
                 }
                 else
                 {
                     throw new KeyNotFoundException();
                 }
-
-                updatedRows.Add(updatedRow);
             }
 
             return updatedRows;
@@ -6199,24 +6129,22 @@ namespace UnitTest.Slave
         {
             var enlistmentState = this.EnlistmentState;
             ArgumentNullException.ThrowIfNull(enlistmentState);
-            if (this.dictionary.TryGetValue(account.AccountId, out var updatedRow))
+            if (this.dictionary.TryGetValue(account.AccountId, out var foundRow))
             {
-                await updatedRow.EnterWriteLockAsync().ConfigureAwait(true);
-                var originalRow = new Account(updatedRow);
-                enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                updatedRow.AccountId = account.AccountId;
-                updatedRow.Name = account.Name;
+                await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
+                var originalRow = new Account(foundRow);
+                enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                foundRow.AccountId = account.AccountId;
+                foundRow.Name = account.Name;
                 this.fixture.RowVersion = account.RowVersion;
-                var clone = new Account(updatedRow);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
-                updatedRow = clone;
+                var clonedRow = new Account(foundRow);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                return clonedRow;
             }
             else
             {
                 throw new KeyNotFoundException();
             }
-
-            return updatedRow;
         }
     }
 
@@ -6406,6 +6334,11 @@ namespace UnitTest.Slave
                     return null;
                 }
 
+                if (asyncTransaction.CancellationToken.IsCancellationRequested)
+                {
+                    throw new OperationCanceledException();
+                }
+
                 this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
                 return enlistmentState;
             }
@@ -6426,9 +6359,9 @@ namespace UnitTest.Slave
             this.fixture.RowVersion = asset.RowVersion;
             this.dictionary.Add(asset.AssetId, asset);
             enlistmentState.RollbackStack.Push(() => this.dictionary.Remove(asset.AssetId));
-            var clone = new Asset(asset);
-            enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-            return clone;
+            var clonedRow = new Asset(asset);
+            enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+            return clonedRow;
         }
 
         /// <summary>
@@ -6449,9 +6382,9 @@ namespace UnitTest.Slave
                 this.fixture.RowVersion = asset.RowVersion;
                 this.dictionary.Add(asset.AssetId, asset);
                 enlistmentState.RollbackStack.Push(() => this.dictionary.Remove(asset.AssetId));
-                var clone = new Asset(asset);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-                addedRows.Add(clone);
+                var clonedRow = new Asset(asset);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+                addedRows.Add(clonedRow);
             }
 
             return addedRows;
@@ -6596,17 +6529,17 @@ namespace UnitTest.Slave
             var updatedRows = new List<Asset>();
             foreach (var asset in assets)
             {
-                if (this.dictionary.TryGetValue(asset.AssetId, out var updatedRow))
+                if (this.dictionary.TryGetValue(asset.AssetId, out var foundRow))
                 {
-                    await updatedRow.EnterWriteLockAsync().ConfigureAwait(true);
-                    var originalRow = new Asset(updatedRow);
-                    enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                    updatedRow.AssetId = asset.AssetId;
-                    updatedRow.Name = asset.Name;
+                    await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
+                    var originalRow = new Asset(foundRow);
+                    enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                    foundRow.AssetId = asset.AssetId;
+                    foundRow.Name = asset.Name;
                     this.fixture.RowVersion = asset.RowVersion;
-                    var clone = new Asset(updatedRow);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
-                    updatedRows.Add(clone);
+                    var clonedRow = new Asset(foundRow);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                    updatedRows.Add(clonedRow);
                 }
                 else
                 {
@@ -6616,9 +6549,9 @@ namespace UnitTest.Slave
                     this.fixture.RowVersion = asset.RowVersion;
                     this.dictionary.Add(asset.AssetId, asset);
                     enlistmentState.RollbackStack.Push(() => this.dictionary.Remove(asset.AssetId));
-                    var clone = new Asset(asset);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-                    addedRows.Add(clone);
+                    var clonedRow = new Asset(asset);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+                    addedRows.Add(clonedRow);
                 }
             }
 
@@ -6640,18 +6573,17 @@ namespace UnitTest.Slave
         {
             var enlistmentState = this.EnlistmentState;
             ArgumentNullException.ThrowIfNull(enlistmentState);
-            Asset? addedRow = null;
-            if (this.dictionary.TryGetValue(asset.AssetId, out var updatedRow))
+            if (this.dictionary.TryGetValue(asset.AssetId, out var foundRow))
             {
-                await updatedRow.EnterWriteLockAsync().ConfigureAwait(true);
-                var originalRow = new Asset(updatedRow);
-                enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                updatedRow.AssetId = asset.AssetId;
-                updatedRow.Name = asset.Name;
+                await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
+                var originalRow = new Asset(foundRow);
+                enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                foundRow.AssetId = asset.AssetId;
+                foundRow.Name = asset.Name;
                 this.fixture.RowVersion = asset.RowVersion;
-                var clone = new Asset(updatedRow);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
-                updatedRow = clone;
+                var clonedRow = new Asset(foundRow);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                return (AddedRow: null, UpdatedRow: clonedRow);
             }
             else
             {
@@ -6661,12 +6593,10 @@ namespace UnitTest.Slave
                 this.fixture.RowVersion = asset.RowVersion;
                 this.dictionary.Add(asset.AssetId, asset);
                 enlistmentState.RollbackStack.Push(() => this.dictionary.Remove(asset.AssetId));
-                var clone = new Asset(asset);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-                addedRow = asset;
+                var clonedRow = new Asset(asset);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+                return (AddedRow: clonedRow, UpdatedRow: null);
             }
-
-            return (AddedRow: addedRow, UpdatedRow: updatedRow);
         }
 
         /// <summary>
@@ -6681,41 +6611,32 @@ namespace UnitTest.Slave
             var removedRows = new List<Asset>();
             foreach (var asset in assets)
             {
-                if (this.dictionary.TryGetValue(asset.AssetId, out var removedRow))
+                if (this.dictionary.TryGetValue(asset.AssetId, out var foundRow))
                 {
-                    await removedRow.EnterWriteLockAsync().ConfigureAwait(true);
-                    var originalRow = new Asset(removedRow);
-                    enlistmentState.RollbackStack.Push(() => removedRow.CopyFrom(originalRow));
-                    if (removedRow.Orders.Any())
+                    await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
+                    var originalRow = new Asset(foundRow);
+                    enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                    if (foundRow.Orders.Any())
                     {
                         throw new ConstraintException("The remove action conflicted with the constraint AssetOrderIndex");
                     }
 
-                    if (removedRow.Positions.Any())
+                    if (foundRow.Positions.Any())
                     {
                         throw new ConstraintException("The remove action conflicted with the constraint AssetPositionIndex");
                     }
 
-                    if (removedRow.Quotes.Any())
+                    if (foundRow.Quotes.Any())
                     {
                         throw new ConstraintException("The remove action conflicted with the constraint AssetQuoteIndex");
                     }
 
-                    this.fixture.RowVersion = removedRow.RowVersion;
-                    this.dictionary.Remove(removedRow.AssetId);
-                    enlistmentState.RollbackStack.Push(() => this.dictionary.Add(removedRow.AssetId, removedRow));
-                    var clone = new Asset(removedRow);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clone));
-                    removedRow = clone;
-                }
-                else
-                {
-                    removedRow = null;
-                }
-
-                if (removedRow != null)
-                {
-                    removedRows.Add(removedRow);
+                    this.fixture.RowVersion = foundRow.RowVersion;
+                    this.dictionary.Remove(foundRow.AssetId);
+                    enlistmentState.RollbackStack.Push(() => this.dictionary.Add(foundRow.AssetId, foundRow));
+                    var clonedRow = new Asset(foundRow);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clonedRow));
+                    removedRows.Add(clonedRow);
                 }
             }
 
@@ -6731,39 +6652,37 @@ namespace UnitTest.Slave
         {
             var enlistmentState = this.EnlistmentState;
             ArgumentNullException.ThrowIfNull(enlistmentState);
-            if (this.dictionary.TryGetValue(asset.AssetId, out var removedRow))
+            if (this.dictionary.TryGetValue(asset.AssetId, out var foundRow))
             {
-                await removedRow.EnterWriteLockAsync().ConfigureAwait(true);
-                var originalRow = new Asset(removedRow);
-                enlistmentState.RollbackStack.Push(() => removedRow.CopyFrom(originalRow));
-                if (removedRow.Orders.Any())
+                await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
+                var originalRow = new Asset(foundRow);
+                enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                if (foundRow.Orders.Any())
                 {
                     throw new ConstraintException("The remove action conflicted with the constraint AssetOrderIndex");
                 }
 
-                if (removedRow.Positions.Any())
+                if (foundRow.Positions.Any())
                 {
                     throw new ConstraintException("The remove action conflicted with the constraint AssetPositionIndex");
                 }
 
-                if (removedRow.Quotes.Any())
+                if (foundRow.Quotes.Any())
                 {
                     throw new ConstraintException("The remove action conflicted with the constraint AssetQuoteIndex");
                 }
 
-                this.fixture.RowVersion = removedRow.RowVersion;
-                this.dictionary.Remove(removedRow.AssetId);
-                enlistmentState.RollbackStack.Push(() => this.dictionary.Add(removedRow.AssetId, removedRow));
-                var clone = new Asset(removedRow);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clone));
-                removedRow = clone;
+                this.fixture.RowVersion = foundRow.RowVersion;
+                this.dictionary.Remove(foundRow.AssetId);
+                enlistmentState.RollbackStack.Push(() => this.dictionary.Add(foundRow.AssetId, foundRow));
+                var clonedRow = new Asset(foundRow);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clonedRow));
+                return clonedRow;
             }
             else
             {
-                removedRow = null;
+                return null;
             }
-
-            return removedRow;
         }
 
         /// <inheritdoc/>
@@ -6794,23 +6713,22 @@ namespace UnitTest.Slave
             var updatedRows = new List<Asset>();
             foreach (var asset in assets)
             {
-                if (this.dictionary.TryGetValue(asset.AssetId, out var updatedRow))
+                if (this.dictionary.TryGetValue(asset.AssetId, out var foundRow))
                 {
-                    await updatedRow.EnterWriteLockAsync().ConfigureAwait(true);
-                    var originalRow = new Asset(updatedRow);
-                    enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                    updatedRow.AssetId = asset.AssetId;
-                    updatedRow.Name = asset.Name;
+                    await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
+                    var originalRow = new Asset(foundRow);
+                    enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                    foundRow.AssetId = asset.AssetId;
+                    foundRow.Name = asset.Name;
                     this.fixture.RowVersion = asset.RowVersion;
-                    var clone = new Asset(updatedRow);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
+                    var clonedRow = new Asset(foundRow);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                    updatedRows.Add(clonedRow);
                 }
                 else
                 {
                     throw new KeyNotFoundException();
                 }
-
-                updatedRows.Add(updatedRow);
             }
 
             return updatedRows;
@@ -6824,24 +6742,22 @@ namespace UnitTest.Slave
         {
             var enlistmentState = this.EnlistmentState;
             ArgumentNullException.ThrowIfNull(enlistmentState);
-            if (this.dictionary.TryGetValue(asset.AssetId, out var updatedRow))
+            if (this.dictionary.TryGetValue(asset.AssetId, out var foundRow))
             {
-                await updatedRow.EnterWriteLockAsync().ConfigureAwait(true);
-                var originalRow = new Asset(updatedRow);
-                enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                updatedRow.AssetId = asset.AssetId;
-                updatedRow.Name = asset.Name;
+                await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
+                var originalRow = new Asset(foundRow);
+                enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                foundRow.AssetId = asset.AssetId;
+                foundRow.Name = asset.Name;
                 this.fixture.RowVersion = asset.RowVersion;
-                var clone = new Asset(updatedRow);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
-                updatedRow = clone;
+                var clonedRow = new Asset(foundRow);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                return clonedRow;
             }
             else
             {
                 throw new KeyNotFoundException();
             }
-
-            return updatedRow;
         }
     }
 
@@ -7699,6 +7615,11 @@ namespace UnitTest.Slave
                     return null;
                 }
 
+                if (asyncTransaction.CancellationToken.IsCancellationRequested)
+                {
+                    throw new OperationCanceledException();
+                }
+
                 this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
                 return enlistmentState;
             }
@@ -7739,9 +7660,9 @@ namespace UnitTest.Slave
             this.fixture.RowVersion = order.RowVersion;
             this.dictionary.Add((order.AccountId, order.AssetId), order);
             enlistmentState.RollbackStack.Push(() => this.dictionary.Remove((order.AccountId, order.AssetId)));
-            var clone = new Order(order);
-            enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-            return clone;
+            var clonedRow = new Order(order);
+            enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+            return clonedRow;
         }
 
         /// <summary>
@@ -7782,9 +7703,9 @@ namespace UnitTest.Slave
                 this.fixture.RowVersion = order.RowVersion;
                 this.dictionary.Add((order.AccountId, order.AssetId), order);
                 enlistmentState.RollbackStack.Push(() => this.dictionary.Remove((order.AccountId, order.AssetId)));
-                var clone = new Order(order);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-                addedRows.Add(clone);
+                var clonedRow = new Order(order);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+                addedRows.Add(clonedRow);
             }
 
             return addedRows;
@@ -7946,18 +7867,18 @@ namespace UnitTest.Slave
             var updatedRows = new List<Order>();
             foreach (var order in orders)
             {
-                if (this.dictionary.TryGetValue((order.AccountId, order.AssetId), out var updatedRow))
+                if (this.dictionary.TryGetValue((order.AccountId, order.AssetId), out var foundRow))
                 {
-                    await updatedRow.EnterWriteLockAsync().ConfigureAwait(true);
-                    var originalRow = new Order(updatedRow);
-                    enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                    updatedRow.AccountId = order.AccountId;
-                    updatedRow.AssetId = order.AssetId;
-                    updatedRow.Quantity = order.Quantity;
+                    await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
+                    var originalRow = new Order(foundRow);
+                    enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                    foundRow.AccountId = order.AccountId;
+                    foundRow.AssetId = order.AssetId;
+                    foundRow.Quantity = order.Quantity;
                     this.fixture.RowVersion = order.RowVersion;
-                    var clone = new Order(updatedRow);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
-                    updatedRows.Add(clone);
+                    var clonedRow = new Order(foundRow);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                    updatedRows.Add(clonedRow);
                 }
                 else
                 {
@@ -7987,9 +7908,9 @@ namespace UnitTest.Slave
                     this.fixture.RowVersion = order.RowVersion;
                     this.dictionary.Add((order.AccountId, order.AssetId), order);
                     enlistmentState.RollbackStack.Push(() => this.dictionary.Remove((order.AccountId, order.AssetId)));
-                    var clone = new Order(order);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-                    addedRows.Add(clone);
+                    var clonedRow = new Order(order);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+                    addedRows.Add(clonedRow);
                 }
             }
 
@@ -8011,19 +7932,18 @@ namespace UnitTest.Slave
         {
             var enlistmentState = this.EnlistmentState;
             ArgumentNullException.ThrowIfNull(enlistmentState);
-            Order? addedRow = null;
-            if (this.dictionary.TryGetValue((order.AccountId, order.AssetId), out var updatedRow))
+            if (this.dictionary.TryGetValue((order.AccountId, order.AssetId), out var foundRow))
             {
-                await updatedRow.EnterWriteLockAsync().ConfigureAwait(true);
-                var originalRow = new Order(updatedRow);
-                enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                updatedRow.AccountId = order.AccountId;
-                updatedRow.AssetId = order.AssetId;
-                updatedRow.Quantity = order.Quantity;
+                await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
+                var originalRow = new Order(foundRow);
+                enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                foundRow.AccountId = order.AccountId;
+                foundRow.AssetId = order.AssetId;
+                foundRow.Quantity = order.Quantity;
                 this.fixture.RowVersion = order.RowVersion;
-                var clone = new Order(updatedRow);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
-                updatedRow = clone;
+                var clonedRow = new Order(foundRow);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                return (AddedRow: null, UpdatedRow: clonedRow);
             }
             else
             {
@@ -8053,12 +7973,10 @@ namespace UnitTest.Slave
                 this.fixture.RowVersion = order.RowVersion;
                 this.dictionary.Add((order.AccountId, order.AssetId), order);
                 enlistmentState.RollbackStack.Push(() => this.dictionary.Remove((order.AccountId, order.AssetId)));
-                var clone = new Order(order);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-                addedRow = order;
+                var clonedRow = new Order(order);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+                return (AddedRow: clonedRow, UpdatedRow: null);
             }
-
-            return (AddedRow: addedRow, UpdatedRow: updatedRow);
         }
 
         /// <summary>
@@ -8073,11 +7991,11 @@ namespace UnitTest.Slave
             var removedRows = new List<Order>();
             foreach (var order in orders)
             {
-                if (this.dictionary.TryGetValue((order.AccountId, order.AssetId), out var removedRow))
+                if (this.dictionary.TryGetValue((order.AccountId, order.AssetId), out var foundRow))
                 {
-                    await removedRow.EnterWriteLockAsync().ConfigureAwait(true);
-                    var originalRow = new Order(removedRow);
-                    enlistmentState.RollbackStack.Push(() => removedRow.CopyFrom(originalRow));
+                    await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
+                    var originalRow = new Order(foundRow);
+                    enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
                     var oldAccount = this.fixture.Accounts.Find(order.AccountId);
                     ArgumentNullException.ThrowIfNull(oldAccount);
                     await oldAccount.EnterWriteLockAsync().ConfigureAwait(true);
@@ -8090,21 +8008,12 @@ namespace UnitTest.Slave
                     oldAsset.Orders.Remove(order);
                     enlistmentState.RollbackStack.Push(() => oldAsset.Orders.Add(order));
                     order.Asset = null;
-                    this.fixture.RowVersion = removedRow.RowVersion;
-                    this.dictionary.Remove((removedRow.AccountId, removedRow.AssetId));
-                    enlistmentState.RollbackStack.Push(() => this.dictionary.Add((removedRow.AccountId, removedRow.AssetId), removedRow));
-                    var clone = new Order(removedRow);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clone));
-                    removedRow = clone;
-                }
-                else
-                {
-                    removedRow = null;
-                }
-
-                if (removedRow != null)
-                {
-                    removedRows.Add(removedRow);
+                    this.fixture.RowVersion = foundRow.RowVersion;
+                    this.dictionary.Remove((foundRow.AccountId, foundRow.AssetId));
+                    enlistmentState.RollbackStack.Push(() => this.dictionary.Add((foundRow.AccountId, foundRow.AssetId), foundRow));
+                    var clonedRow = new Order(foundRow);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clonedRow));
+                    removedRows.Add(clonedRow);
                 }
             }
 
@@ -8120,11 +8029,11 @@ namespace UnitTest.Slave
         {
             var enlistmentState = this.EnlistmentState;
             ArgumentNullException.ThrowIfNull(enlistmentState);
-            if (this.dictionary.TryGetValue((order.AccountId, order.AssetId), out var removedRow))
+            if (this.dictionary.TryGetValue((order.AccountId, order.AssetId), out var foundRow))
             {
-                await removedRow.EnterWriteLockAsync().ConfigureAwait(true);
-                var originalRow = new Order(removedRow);
-                enlistmentState.RollbackStack.Push(() => removedRow.CopyFrom(originalRow));
+                await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
+                var originalRow = new Order(foundRow);
+                enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
                 var oldAccount = this.fixture.Accounts.Find(order.AccountId);
                 ArgumentNullException.ThrowIfNull(oldAccount);
                 await oldAccount.EnterWriteLockAsync().ConfigureAwait(true);
@@ -8137,19 +8046,17 @@ namespace UnitTest.Slave
                 oldAsset.Orders.Remove(order);
                 enlistmentState.RollbackStack.Push(() => oldAsset.Orders.Add(order));
                 order.Asset = null;
-                this.fixture.RowVersion = removedRow.RowVersion;
-                this.dictionary.Remove((removedRow.AccountId, removedRow.AssetId));
-                enlistmentState.RollbackStack.Push(() => this.dictionary.Add((removedRow.AccountId, removedRow.AssetId), removedRow));
-                var clone = new Order(removedRow);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clone));
-                removedRow = clone;
+                this.fixture.RowVersion = foundRow.RowVersion;
+                this.dictionary.Remove((foundRow.AccountId, foundRow.AssetId));
+                enlistmentState.RollbackStack.Push(() => this.dictionary.Add((foundRow.AccountId, foundRow.AssetId), foundRow));
+                var clonedRow = new Order(foundRow);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clonedRow));
+                return clonedRow;
             }
             else
             {
-                removedRow = null;
+                return null;
             }
-
-            return removedRow;
         }
 
         /// <inheritdoc/>
@@ -8180,24 +8087,23 @@ namespace UnitTest.Slave
             var updatedRows = new List<Order>();
             foreach (var order in orders)
             {
-                if (this.dictionary.TryGetValue((order.AccountId, order.AssetId), out var updatedRow))
+                if (this.dictionary.TryGetValue((order.AccountId, order.AssetId), out var foundRow))
                 {
-                    await updatedRow.EnterWriteLockAsync().ConfigureAwait(true);
-                    var originalRow = new Order(updatedRow);
-                    enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                    updatedRow.AccountId = order.AccountId;
-                    updatedRow.AssetId = order.AssetId;
-                    updatedRow.Quantity = order.Quantity;
+                    await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
+                    var originalRow = new Order(foundRow);
+                    enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                    foundRow.AccountId = order.AccountId;
+                    foundRow.AssetId = order.AssetId;
+                    foundRow.Quantity = order.Quantity;
                     this.fixture.RowVersion = order.RowVersion;
-                    var clone = new Order(updatedRow);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
+                    var clonedRow = new Order(foundRow);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                    updatedRows.Add(clonedRow);
                 }
                 else
                 {
                     throw new KeyNotFoundException();
                 }
-
-                updatedRows.Add(updatedRow);
             }
 
             return updatedRows;
@@ -8211,25 +8117,23 @@ namespace UnitTest.Slave
         {
             var enlistmentState = this.EnlistmentState;
             ArgumentNullException.ThrowIfNull(enlistmentState);
-            if (this.dictionary.TryGetValue((order.AccountId, order.AssetId), out var updatedRow))
+            if (this.dictionary.TryGetValue((order.AccountId, order.AssetId), out var foundRow))
             {
-                await updatedRow.EnterWriteLockAsync().ConfigureAwait(true);
-                var originalRow = new Order(updatedRow);
-                enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                updatedRow.AccountId = order.AccountId;
-                updatedRow.AssetId = order.AssetId;
-                updatedRow.Quantity = order.Quantity;
+                await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
+                var originalRow = new Order(foundRow);
+                enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                foundRow.AccountId = order.AccountId;
+                foundRow.AssetId = order.AssetId;
+                foundRow.Quantity = order.Quantity;
                 this.fixture.RowVersion = order.RowVersion;
-                var clone = new Order(updatedRow);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
-                updatedRow = clone;
+                var clonedRow = new Order(foundRow);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                return clonedRow;
             }
             else
             {
                 throw new KeyNotFoundException();
             }
-
-            return updatedRow;
         }
     }
 
@@ -8416,6 +8320,11 @@ namespace UnitTest.Slave
                     return null;
                 }
 
+                if (asyncTransaction.CancellationToken.IsCancellationRequested)
+                {
+                    throw new OperationCanceledException();
+                }
+
                 this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
                 return enlistmentState;
             }
@@ -8456,9 +8365,9 @@ namespace UnitTest.Slave
             this.fixture.RowVersion = position.RowVersion;
             this.dictionary.Add((position.AccountId, position.AssetId), position);
             enlistmentState.RollbackStack.Push(() => this.dictionary.Remove((position.AccountId, position.AssetId)));
-            var clone = new Position(position);
-            enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-            return clone;
+            var clonedRow = new Position(position);
+            enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+            return clonedRow;
         }
 
         /// <summary>
@@ -8499,9 +8408,9 @@ namespace UnitTest.Slave
                 this.fixture.RowVersion = position.RowVersion;
                 this.dictionary.Add((position.AccountId, position.AssetId), position);
                 enlistmentState.RollbackStack.Push(() => this.dictionary.Remove((position.AccountId, position.AssetId)));
-                var clone = new Position(position);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-                addedRows.Add(clone);
+                var clonedRow = new Position(position);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+                addedRows.Add(clonedRow);
             }
 
             return addedRows;
@@ -8663,18 +8572,18 @@ namespace UnitTest.Slave
             var updatedRows = new List<Position>();
             foreach (var position in positions)
             {
-                if (this.dictionary.TryGetValue((position.AccountId, position.AssetId), out var updatedRow))
+                if (this.dictionary.TryGetValue((position.AccountId, position.AssetId), out var foundRow))
                 {
-                    await updatedRow.EnterWriteLockAsync().ConfigureAwait(true);
-                    var originalRow = new Position(updatedRow);
-                    enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                    updatedRow.AccountId = position.AccountId;
-                    updatedRow.AssetId = position.AssetId;
-                    updatedRow.Quantity = position.Quantity;
+                    await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
+                    var originalRow = new Position(foundRow);
+                    enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                    foundRow.AccountId = position.AccountId;
+                    foundRow.AssetId = position.AssetId;
+                    foundRow.Quantity = position.Quantity;
                     this.fixture.RowVersion = position.RowVersion;
-                    var clone = new Position(updatedRow);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
-                    updatedRows.Add(clone);
+                    var clonedRow = new Position(foundRow);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                    updatedRows.Add(clonedRow);
                 }
                 else
                 {
@@ -8704,9 +8613,9 @@ namespace UnitTest.Slave
                     this.fixture.RowVersion = position.RowVersion;
                     this.dictionary.Add((position.AccountId, position.AssetId), position);
                     enlistmentState.RollbackStack.Push(() => this.dictionary.Remove((position.AccountId, position.AssetId)));
-                    var clone = new Position(position);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-                    addedRows.Add(clone);
+                    var clonedRow = new Position(position);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+                    addedRows.Add(clonedRow);
                 }
             }
 
@@ -8728,19 +8637,18 @@ namespace UnitTest.Slave
         {
             var enlistmentState = this.EnlistmentState;
             ArgumentNullException.ThrowIfNull(enlistmentState);
-            Position? addedRow = null;
-            if (this.dictionary.TryGetValue((position.AccountId, position.AssetId), out var updatedRow))
+            if (this.dictionary.TryGetValue((position.AccountId, position.AssetId), out var foundRow))
             {
-                await updatedRow.EnterWriteLockAsync().ConfigureAwait(true);
-                var originalRow = new Position(updatedRow);
-                enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                updatedRow.AccountId = position.AccountId;
-                updatedRow.AssetId = position.AssetId;
-                updatedRow.Quantity = position.Quantity;
+                await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
+                var originalRow = new Position(foundRow);
+                enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                foundRow.AccountId = position.AccountId;
+                foundRow.AssetId = position.AssetId;
+                foundRow.Quantity = position.Quantity;
                 this.fixture.RowVersion = position.RowVersion;
-                var clone = new Position(updatedRow);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
-                updatedRow = clone;
+                var clonedRow = new Position(foundRow);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                return (AddedRow: null, UpdatedRow: clonedRow);
             }
             else
             {
@@ -8770,12 +8678,10 @@ namespace UnitTest.Slave
                 this.fixture.RowVersion = position.RowVersion;
                 this.dictionary.Add((position.AccountId, position.AssetId), position);
                 enlistmentState.RollbackStack.Push(() => this.dictionary.Remove((position.AccountId, position.AssetId)));
-                var clone = new Position(position);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-                addedRow = position;
+                var clonedRow = new Position(position);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+                return (AddedRow: clonedRow, UpdatedRow: null);
             }
-
-            return (AddedRow: addedRow, UpdatedRow: updatedRow);
         }
 
         /// <summary>
@@ -8790,11 +8696,11 @@ namespace UnitTest.Slave
             var removedRows = new List<Position>();
             foreach (var position in positions)
             {
-                if (this.dictionary.TryGetValue((position.AccountId, position.AssetId), out var removedRow))
+                if (this.dictionary.TryGetValue((position.AccountId, position.AssetId), out var foundRow))
                 {
-                    await removedRow.EnterWriteLockAsync().ConfigureAwait(true);
-                    var originalRow = new Position(removedRow);
-                    enlistmentState.RollbackStack.Push(() => removedRow.CopyFrom(originalRow));
+                    await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
+                    var originalRow = new Position(foundRow);
+                    enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
                     var oldAccount = this.fixture.Accounts.Find(position.AccountId);
                     ArgumentNullException.ThrowIfNull(oldAccount);
                     await oldAccount.EnterWriteLockAsync().ConfigureAwait(true);
@@ -8807,21 +8713,12 @@ namespace UnitTest.Slave
                     oldAsset.Positions.Remove(position);
                     enlistmentState.RollbackStack.Push(() => oldAsset.Positions.Add(position));
                     position.Asset = null;
-                    this.fixture.RowVersion = removedRow.RowVersion;
-                    this.dictionary.Remove((removedRow.AccountId, removedRow.AssetId));
-                    enlistmentState.RollbackStack.Push(() => this.dictionary.Add((removedRow.AccountId, removedRow.AssetId), removedRow));
-                    var clone = new Position(removedRow);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clone));
-                    removedRow = clone;
-                }
-                else
-                {
-                    removedRow = null;
-                }
-
-                if (removedRow != null)
-                {
-                    removedRows.Add(removedRow);
+                    this.fixture.RowVersion = foundRow.RowVersion;
+                    this.dictionary.Remove((foundRow.AccountId, foundRow.AssetId));
+                    enlistmentState.RollbackStack.Push(() => this.dictionary.Add((foundRow.AccountId, foundRow.AssetId), foundRow));
+                    var clonedRow = new Position(foundRow);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clonedRow));
+                    removedRows.Add(clonedRow);
                 }
             }
 
@@ -8837,11 +8734,11 @@ namespace UnitTest.Slave
         {
             var enlistmentState = this.EnlistmentState;
             ArgumentNullException.ThrowIfNull(enlistmentState);
-            if (this.dictionary.TryGetValue((position.AccountId, position.AssetId), out var removedRow))
+            if (this.dictionary.TryGetValue((position.AccountId, position.AssetId), out var foundRow))
             {
-                await removedRow.EnterWriteLockAsync().ConfigureAwait(true);
-                var originalRow = new Position(removedRow);
-                enlistmentState.RollbackStack.Push(() => removedRow.CopyFrom(originalRow));
+                await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
+                var originalRow = new Position(foundRow);
+                enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
                 var oldAccount = this.fixture.Accounts.Find(position.AccountId);
                 ArgumentNullException.ThrowIfNull(oldAccount);
                 await oldAccount.EnterWriteLockAsync().ConfigureAwait(true);
@@ -8854,19 +8751,17 @@ namespace UnitTest.Slave
                 oldAsset.Positions.Remove(position);
                 enlistmentState.RollbackStack.Push(() => oldAsset.Positions.Add(position));
                 position.Asset = null;
-                this.fixture.RowVersion = removedRow.RowVersion;
-                this.dictionary.Remove((removedRow.AccountId, removedRow.AssetId));
-                enlistmentState.RollbackStack.Push(() => this.dictionary.Add((removedRow.AccountId, removedRow.AssetId), removedRow));
-                var clone = new Position(removedRow);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clone));
-                removedRow = clone;
+                this.fixture.RowVersion = foundRow.RowVersion;
+                this.dictionary.Remove((foundRow.AccountId, foundRow.AssetId));
+                enlistmentState.RollbackStack.Push(() => this.dictionary.Add((foundRow.AccountId, foundRow.AssetId), foundRow));
+                var clonedRow = new Position(foundRow);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clonedRow));
+                return clonedRow;
             }
             else
             {
-                removedRow = null;
+                return null;
             }
-
-            return removedRow;
         }
 
         /// <inheritdoc/>
@@ -8897,24 +8792,23 @@ namespace UnitTest.Slave
             var updatedRows = new List<Position>();
             foreach (var position in positions)
             {
-                if (this.dictionary.TryGetValue((position.AccountId, position.AssetId), out var updatedRow))
+                if (this.dictionary.TryGetValue((position.AccountId, position.AssetId), out var foundRow))
                 {
-                    await updatedRow.EnterWriteLockAsync().ConfigureAwait(true);
-                    var originalRow = new Position(updatedRow);
-                    enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                    updatedRow.AccountId = position.AccountId;
-                    updatedRow.AssetId = position.AssetId;
-                    updatedRow.Quantity = position.Quantity;
+                    await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
+                    var originalRow = new Position(foundRow);
+                    enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                    foundRow.AccountId = position.AccountId;
+                    foundRow.AssetId = position.AssetId;
+                    foundRow.Quantity = position.Quantity;
                     this.fixture.RowVersion = position.RowVersion;
-                    var clone = new Position(updatedRow);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
+                    var clonedRow = new Position(foundRow);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                    updatedRows.Add(clonedRow);
                 }
                 else
                 {
                     throw new KeyNotFoundException();
                 }
-
-                updatedRows.Add(updatedRow);
             }
 
             return updatedRows;
@@ -8928,25 +8822,23 @@ namespace UnitTest.Slave
         {
             var enlistmentState = this.EnlistmentState;
             ArgumentNullException.ThrowIfNull(enlistmentState);
-            if (this.dictionary.TryGetValue((position.AccountId, position.AssetId), out var updatedRow))
+            if (this.dictionary.TryGetValue((position.AccountId, position.AssetId), out var foundRow))
             {
-                await updatedRow.EnterWriteLockAsync().ConfigureAwait(true);
-                var originalRow = new Position(updatedRow);
-                enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                updatedRow.AccountId = position.AccountId;
-                updatedRow.AssetId = position.AssetId;
-                updatedRow.Quantity = position.Quantity;
+                await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
+                var originalRow = new Position(foundRow);
+                enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                foundRow.AccountId = position.AccountId;
+                foundRow.AssetId = position.AssetId;
+                foundRow.Quantity = position.Quantity;
                 this.fixture.RowVersion = position.RowVersion;
-                var clone = new Position(updatedRow);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
-                updatedRow = clone;
+                var clonedRow = new Position(foundRow);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                return clonedRow;
             }
             else
             {
                 throw new KeyNotFoundException();
             }
-
-            return updatedRow;
         }
     }
 
@@ -9117,6 +9009,11 @@ namespace UnitTest.Slave
                     return null;
                 }
 
+                if (asyncTransaction.CancellationToken.IsCancellationRequested)
+                {
+                    throw new OperationCanceledException();
+                }
+
                 this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
                 return enlistmentState;
             }
@@ -9147,9 +9044,9 @@ namespace UnitTest.Slave
             this.fixture.RowVersion = quote.RowVersion;
             this.dictionary.Add(quote.AssetId, quote);
             enlistmentState.RollbackStack.Push(() => this.dictionary.Remove(quote.AssetId));
-            var clone = new Quote(quote);
-            enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-            return clone;
+            var clonedRow = new Quote(quote);
+            enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+            return clonedRow;
         }
 
         /// <summary>
@@ -9180,9 +9077,9 @@ namespace UnitTest.Slave
                 this.fixture.RowVersion = quote.RowVersion;
                 this.dictionary.Add(quote.AssetId, quote);
                 enlistmentState.RollbackStack.Push(() => this.dictionary.Remove(quote.AssetId));
-                var clone = new Quote(quote);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-                addedRows.Add(clone);
+                var clonedRow = new Quote(quote);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+                addedRows.Add(clonedRow);
             }
 
             return addedRows;
@@ -9335,17 +9232,17 @@ namespace UnitTest.Slave
             var updatedRows = new List<Quote>();
             foreach (var quote in quotes)
             {
-                if (this.dictionary.TryGetValue(quote.AssetId, out var updatedRow))
+                if (this.dictionary.TryGetValue(quote.AssetId, out var foundRow))
                 {
-                    await updatedRow.EnterWriteLockAsync().ConfigureAwait(true);
-                    var originalRow = new Quote(updatedRow);
-                    enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                    updatedRow.AssetId = quote.AssetId;
-                    updatedRow.Last = quote.Last;
+                    await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
+                    var originalRow = new Quote(foundRow);
+                    enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                    foundRow.AssetId = quote.AssetId;
+                    foundRow.Last = quote.Last;
                     this.fixture.RowVersion = quote.RowVersion;
-                    var clone = new Quote(updatedRow);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
-                    updatedRows.Add(clone);
+                    var clonedRow = new Quote(foundRow);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                    updatedRows.Add(clonedRow);
                 }
                 else
                 {
@@ -9365,9 +9262,9 @@ namespace UnitTest.Slave
                     this.fixture.RowVersion = quote.RowVersion;
                     this.dictionary.Add(quote.AssetId, quote);
                     enlistmentState.RollbackStack.Push(() => this.dictionary.Remove(quote.AssetId));
-                    var clone = new Quote(quote);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-                    addedRows.Add(clone);
+                    var clonedRow = new Quote(quote);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+                    addedRows.Add(clonedRow);
                 }
             }
 
@@ -9389,18 +9286,17 @@ namespace UnitTest.Slave
         {
             var enlistmentState = this.EnlistmentState;
             ArgumentNullException.ThrowIfNull(enlistmentState);
-            Quote? addedRow = null;
-            if (this.dictionary.TryGetValue(quote.AssetId, out var updatedRow))
+            if (this.dictionary.TryGetValue(quote.AssetId, out var foundRow))
             {
-                await updatedRow.EnterWriteLockAsync().ConfigureAwait(true);
-                var originalRow = new Quote(updatedRow);
-                enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                updatedRow.AssetId = quote.AssetId;
-                updatedRow.Last = quote.Last;
+                await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
+                var originalRow = new Quote(foundRow);
+                enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                foundRow.AssetId = quote.AssetId;
+                foundRow.Last = quote.Last;
                 this.fixture.RowVersion = quote.RowVersion;
-                var clone = new Quote(updatedRow);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
-                updatedRow = clone;
+                var clonedRow = new Quote(foundRow);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                return (AddedRow: null, UpdatedRow: clonedRow);
             }
             else
             {
@@ -9420,12 +9316,10 @@ namespace UnitTest.Slave
                 this.fixture.RowVersion = quote.RowVersion;
                 this.dictionary.Add(quote.AssetId, quote);
                 enlistmentState.RollbackStack.Push(() => this.dictionary.Remove(quote.AssetId));
-                var clone = new Quote(quote);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clone));
-                addedRow = quote;
+                var clonedRow = new Quote(quote);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Add, clonedRow));
+                return (AddedRow: clonedRow, UpdatedRow: null);
             }
-
-            return (AddedRow: addedRow, UpdatedRow: updatedRow);
         }
 
         /// <summary>
@@ -9440,32 +9334,23 @@ namespace UnitTest.Slave
             var removedRows = new List<Quote>();
             foreach (var quote in quotes)
             {
-                if (this.dictionary.TryGetValue(quote.AssetId, out var removedRow))
+                if (this.dictionary.TryGetValue(quote.AssetId, out var foundRow))
                 {
-                    await removedRow.EnterWriteLockAsync().ConfigureAwait(true);
-                    var originalRow = new Quote(removedRow);
-                    enlistmentState.RollbackStack.Push(() => removedRow.CopyFrom(originalRow));
+                    await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
+                    var originalRow = new Quote(foundRow);
+                    enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
                     var oldAsset = this.fixture.Assets.Find(quote.AssetId);
                     ArgumentNullException.ThrowIfNull(oldAsset);
                     await oldAsset.EnterWriteLockAsync().ConfigureAwait(true);
                     oldAsset.Quotes.Remove(quote);
                     enlistmentState.RollbackStack.Push(() => oldAsset.Quotes.Add(quote));
                     quote.Asset = null;
-                    this.fixture.RowVersion = removedRow.RowVersion;
-                    this.dictionary.Remove(removedRow.AssetId);
-                    enlistmentState.RollbackStack.Push(() => this.dictionary.Add(removedRow.AssetId, removedRow));
-                    var clone = new Quote(removedRow);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clone));
-                    removedRow = clone;
-                }
-                else
-                {
-                    removedRow = null;
-                }
-
-                if (removedRow != null)
-                {
-                    removedRows.Add(removedRow);
+                    this.fixture.RowVersion = foundRow.RowVersion;
+                    this.dictionary.Remove(foundRow.AssetId);
+                    enlistmentState.RollbackStack.Push(() => this.dictionary.Add(foundRow.AssetId, foundRow));
+                    var clonedRow = new Quote(foundRow);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clonedRow));
+                    removedRows.Add(clonedRow);
                 }
             }
 
@@ -9481,30 +9366,28 @@ namespace UnitTest.Slave
         {
             var enlistmentState = this.EnlistmentState;
             ArgumentNullException.ThrowIfNull(enlistmentState);
-            if (this.dictionary.TryGetValue(quote.AssetId, out var removedRow))
+            if (this.dictionary.TryGetValue(quote.AssetId, out var foundRow))
             {
-                await removedRow.EnterWriteLockAsync().ConfigureAwait(true);
-                var originalRow = new Quote(removedRow);
-                enlistmentState.RollbackStack.Push(() => removedRow.CopyFrom(originalRow));
+                await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
+                var originalRow = new Quote(foundRow);
+                enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
                 var oldAsset = this.fixture.Assets.Find(quote.AssetId);
                 ArgumentNullException.ThrowIfNull(oldAsset);
                 await oldAsset.EnterWriteLockAsync().ConfigureAwait(true);
                 oldAsset.Quotes.Remove(quote);
                 enlistmentState.RollbackStack.Push(() => oldAsset.Quotes.Add(quote));
                 quote.Asset = null;
-                this.fixture.RowVersion = removedRow.RowVersion;
-                this.dictionary.Remove(removedRow.AssetId);
-                enlistmentState.RollbackStack.Push(() => this.dictionary.Add(removedRow.AssetId, removedRow));
-                var clone = new Quote(removedRow);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clone));
-                removedRow = clone;
+                this.fixture.RowVersion = foundRow.RowVersion;
+                this.dictionary.Remove(foundRow.AssetId);
+                enlistmentState.RollbackStack.Push(() => this.dictionary.Add(foundRow.AssetId, foundRow));
+                var clonedRow = new Quote(foundRow);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Remove, clonedRow));
+                return clonedRow;
             }
             else
             {
-                removedRow = null;
+                return null;
             }
-
-            return removedRow;
         }
 
         /// <inheritdoc/>
@@ -9535,23 +9418,22 @@ namespace UnitTest.Slave
             var updatedRows = new List<Quote>();
             foreach (var quote in quotes)
             {
-                if (this.dictionary.TryGetValue(quote.AssetId, out var updatedRow))
+                if (this.dictionary.TryGetValue(quote.AssetId, out var foundRow))
                 {
-                    await updatedRow.EnterWriteLockAsync().ConfigureAwait(true);
-                    var originalRow = new Quote(updatedRow);
-                    enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                    updatedRow.AssetId = quote.AssetId;
-                    updatedRow.Last = quote.Last;
+                    await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
+                    var originalRow = new Quote(foundRow);
+                    enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                    foundRow.AssetId = quote.AssetId;
+                    foundRow.Last = quote.Last;
                     this.fixture.RowVersion = quote.RowVersion;
-                    var clone = new Quote(updatedRow);
-                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
+                    var clonedRow = new Quote(foundRow);
+                    enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                    updatedRows.Add(clonedRow);
                 }
                 else
                 {
                     throw new KeyNotFoundException();
                 }
-
-                updatedRows.Add(updatedRow);
             }
 
             return updatedRows;
@@ -9565,24 +9447,22 @@ namespace UnitTest.Slave
         {
             var enlistmentState = this.EnlistmentState;
             ArgumentNullException.ThrowIfNull(enlistmentState);
-            if (this.dictionary.TryGetValue(quote.AssetId, out var updatedRow))
+            if (this.dictionary.TryGetValue(quote.AssetId, out var foundRow))
             {
-                await updatedRow.EnterWriteLockAsync().ConfigureAwait(true);
-                var originalRow = new Quote(updatedRow);
-                enlistmentState.RollbackStack.Push(() => updatedRow.CopyFrom(originalRow));
-                updatedRow.AssetId = quote.AssetId;
-                updatedRow.Last = quote.Last;
+                await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
+                var originalRow = new Quote(foundRow);
+                enlistmentState.RollbackStack.Push(() => foundRow.CopyFrom(originalRow));
+                foundRow.AssetId = quote.AssetId;
+                foundRow.Last = quote.Last;
                 this.fixture.RowVersion = quote.RowVersion;
-                var clone = new Quote(updatedRow);
-                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clone));
-                updatedRow = clone;
+                var clonedRow = new Quote(foundRow);
+                enlistmentState.CommitStack.Push(() => this.OnRowChanged(DataAction.Update, clonedRow));
+                return clonedRow;
             }
             else
             {
                 throw new KeyNotFoundException();
             }
-
-            return updatedRow;
         }
     }
 }
