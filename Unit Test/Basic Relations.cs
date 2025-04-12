@@ -60,13 +60,12 @@ namespace UnitTest
                 Quantity = 100.0m,
             };
 
-            // Transaction to populate data model.
+            // Transaction to populate the account and asset.
             using (var asyncTransaction = new AsyncTransaction())
             {
                 // Lock the tables.
                 await fixture.Accounts.EnterWriteLockAsync();
                 await fixture.Assets.EnterWriteLockAsync();
-                await fixture.Positions.EnterWriteLockAsync();
 
                 // Add the account.
                 await account.EnterWriteLockAsync();
@@ -75,6 +74,18 @@ namespace UnitTest
                 // Add the asset.
                 await asset.EnterWriteLockAsync();
                 await fixture.Assets.AddAsync(asset);
+
+                // Commit the changes.
+                asyncTransaction.Complete();
+            }
+
+            // Transaction to populate data model.
+            using (var asyncTransaction = new AsyncTransaction())
+            {
+                // Lock the tables.
+                await fixture.Positions.EnterWriteLockAsync();
+                await fixture.Accounts.EnterReadLockAsync();
+                await fixture.Assets.EnterReadLockAsync();
 
                 // Add the position.
                 await position.EnterWriteLockAsync();
@@ -144,13 +155,12 @@ namespace UnitTest
                 Quantity = 100.0m,
             };
 
-            // Transaction to populate data model.
+            // Transaction to populate the account and asset.
             using (var asyncTransaction = new AsyncTransaction())
             {
                 // Lock the tables.
-                await fixture.Assets.EnterWriteLockAsync();
                 await fixture.Accounts.EnterWriteLockAsync();
-                await fixture.Positions.EnterWriteLockAsync();
+                await fixture.Assets.EnterWriteLockAsync();
 
                 // Add the account.
                 await account.EnterWriteLockAsync();
@@ -160,11 +170,23 @@ namespace UnitTest
                 await asset.EnterWriteLockAsync();
                 await fixture.Assets.AddAsync(asset);
 
+                // Commit the changes.
+                asyncTransaction.Complete();
+            }
+
+            // Transaction to populate data model.
+            using (var asyncTransaction = new AsyncTransaction())
+            {
+                // Lock the tables.
+                await fixture.Positions.EnterWriteLockAsync();
+                await fixture.Accounts.EnterReadLockAsync();
+                await fixture.Assets.EnterReadLockAsync();
+
                 // Add the position.
                 await position.EnterWriteLockAsync();
                 await fixture.Positions.AddAsync(position);
 
-                // Don't commit the results.
+                // Don't commit the changes.
             }
 
             // Transaction to read the data model.
@@ -175,22 +197,12 @@ namespace UnitTest
                 await fixture.Accounts.EnterReadLockAsync();
                 await fixture.Positions.EnterReadLockAsync();
 
-                // Assert that the tables are empty.
-                Assert.AreEqual(fixture.Accounts.Count(), 0);
-                Assert.AreEqual(fixture.Assets.Count(), 0);
+                // Assert that the table is empty.
                 Assert.AreEqual(fixture.Positions.Count(), 0);
 
                 // Assert that the relations are empty.
                 Assert.IsNull(position.Account);
                 Assert.IsNull(position.Asset);
-
-                // Make sure we can't find the account.
-                account = fixture.Accounts.Find(BasicRelations.AccountId);
-                Assert.IsNull(account);
-
-                // Make sure we can't find the asset.
-                asset = fixture.Assets.Find(BasicRelations.AssetId);
-                Assert.IsNull(asset);
 
                 // Make sure we can't find the position.
                 position = fixture.Positions.Find(BasicRelations.AccountId, BasicRelations.AssetId);

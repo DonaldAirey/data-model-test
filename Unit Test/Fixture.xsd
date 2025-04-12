@@ -7,6 +7,7 @@
 					<xs:complexType>
 						<xs:sequence>
 							<xs:element name="AccountId" gfdata:dataType="System.Guid" type="xs:anyType" />
+							<xs:element name="ModelId" gfdata:dataType="System.Guid" type="xs:anyType" minOccurs="0" />
 							<xs:element name="Name">
 								<xs:simpleType>
 									<xs:restriction base="xs:string">
@@ -21,6 +22,20 @@
 					<xs:complexType>
 						<xs:sequence>
 							<xs:element name="AssetId" gfdata:dataType="System.Guid" type="xs:anyType" />
+							<xs:element name="Name">
+								<xs:simpleType>
+									<xs:restriction base="xs:string">
+										<xs:maxLength value="128" />
+									</xs:restriction>
+								</xs:simpleType>
+							</xs:element>
+						</xs:sequence>
+					</xs:complexType>
+				</xs:element>
+				<xs:element name="Model">
+					<xs:complexType>
+						<xs:sequence>
+							<xs:element name="ModelId" gfdata:dataType="System.Guid" type="xs:anyType" />
 							<xs:element name="Name">
 								<xs:simpleType>
 									<xs:restriction base="xs:string">
@@ -67,6 +82,10 @@
 			<xs:selector xpath=".//mstns:Asset" />
 			<xs:field xpath="mstns:AssetId" />
 		</xs:unique>
+		<xs:unique name="ModelIndex" gfdata:isPrimaryIndex="true">
+			<xs:selector xpath=".//mstns:Model" />
+			<xs:field xpath="mstns:ModelId" />
+		</xs:unique>
 		<xs:unique name="OrderIndex" gfdata:isPrimaryIndex="true">
 			<xs:selector xpath=".//mstns:Order" />
 			<xs:field xpath="mstns:AccountId" />
@@ -100,6 +119,10 @@
 		<xs:keyref name="AssetQuoteIndex" refer="AssetIndex">
 			<xs:selector xpath=".//mstns:Quote" />
 			<xs:field xpath="mstns:AssetId" />
+		</xs:keyref>
+		<xs:keyref name="ModelAccountIndex" refer="ModelIndex">
+			<xs:selector xpath=".//mstns:Account" />
+			<xs:field xpath="mstns:ModelId" />
 		</xs:keyref>
 	</xs:element>
 </xs:schema>

@@ -120,6 +120,18 @@ namespace UnitTest
                 await this.fixture.Assets.AddAsync(meta);
                 await this.fixture.Assets.AddAsync(msft);
 
+                // Commit the changes.
+                asyncTransaction.Complete();
+            }
+
+            // Transaction to populate the quotes.
+            using (var asyncTransaction = new AsyncTransaction())
+            {
+                // Lock the tables.
+                await this.fixture.Quotes.EnterWriteLockAsync();
+                await this.fixture.Accounts.EnterReadLockAsync();
+                await this.fixture.Assets.EnterReadLockAsync();
+
                 // Add the quotes.
                 await aaplQuote.EnterWriteLockAsync();
                 await metaQuote.EnterWriteLockAsync();
@@ -134,7 +146,6 @@ namespace UnitTest
 
             // Spawn the deadlocking threads.
             var readQuoteTask = Task.Run(ReadQuotesAsync);
-            await Task.Delay(1000);
             var writeQuoteTask = Task.Run(WriteQuotesAsync);
 
             try
@@ -147,12 +158,10 @@ namespace UnitTest
             catch (OperationCanceledException)
             {
             }
-            catch (TransactionAbortedException)
-            {
-            }
 
-            // Verify that the transations were rolled back.
-            Assert.AreEqual(aaplQuote.Last, 180.00m);
+            // Verify that the transations were never committed.
+            Assert.AreEqual(180.00m, aaplQuote.Last);
+            Assert.AreEqual(350.00m, msftQuote.Last);
         }
 
         /// <summary>
@@ -179,6 +188,9 @@ namespace UnitTest
             var msftQuote = this.fixture.Quotes.Find(Deadlock.MsftId);
             Assert.IsNotNull(msftQuote);
             await msftQuote.EnterReadLockAsync();
+
+            // Should take an exception waiting for the lock.
+            Assert.Fail("After a deadlock, execution of the task should end.");
         }
 
         /// <summary>
@@ -197,7 +209,7 @@ namespace UnitTest
             var msftQuote = this.fixture.Quotes.Find(Deadlock.MsftId);
             Assert.IsNotNull(msftQuote);
             var msftClone = new Quote(msftQuote);
-            msftClone.Last = 1.50m;
+            msftClone.Last = 1.00m;
             await this.fixture.Quotes.UpdateAsync(msftClone);
 
             // Allow the other task to run.
@@ -209,16 +221,11 @@ namespace UnitTest
             var aaplQuote = this.fixture.Quotes.Find(Deadlock.AaplId);
             Assert.IsNotNull(aaplQuote);
             var applClone = new Quote(aaplQuote);
-            applClone.Last = 1.20m;
+            applClone.Last = 1.00m;
             await this.fixture.Quotes.UpdateAsync(applClone);
 
-            // Simulated a delayed exit. This will give the transaction enough time to expire.
-            await Task.Delay(1000);
-
-            // Attempt to lock another quote.  This should fail because the transaction timeout has expired.
-            var metaQuote = this.fixture.Quotes.Find(Deadlock.MetaId);
-            Assert.IsNotNull(metaQuote);
-            await metaQuote.EnterReadLockAsync();
+            // Should take an exception waiting for the lock.
+            Assert.Fail("After a deadlock, execution of the task should end.");
 
             // Commit the results.
             asyncTransaction.Complete();
