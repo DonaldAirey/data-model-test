@@ -60,8 +60,6 @@ namespace UnitTest
         [TestMethod]
         public async Task BasicDeadlock()
         {
-            System.Diagnostics.Debug.WriteLine("Started test");
-
             // Create the AAPL assets.
             var aapl = new Asset
             {
@@ -113,35 +111,17 @@ namespace UnitTest
                 await this.fixture.Quotes.EnterWriteLockAsync();
 
                 // Add the assets.
-                await aapl.EnterWriteLockAsync();
-                await meta.EnterWriteLockAsync();
-                await msft.EnterWriteLockAsync();
                 await this.fixture.Assets.AddAsync(aapl);
                 await this.fixture.Assets.AddAsync(meta);
                 await this.fixture.Assets.AddAsync(msft);
 
-                // Commit the changes.
-                asyncTransaction.Complete();
-            }
-
-            // Transaction to populate the quotes.
-            using (var asyncTransaction = new AsyncTransaction())
-            {
-                // Lock the tables.
-                await this.fixture.Quotes.EnterWriteLockAsync();
-                await this.fixture.Accounts.EnterReadLockAsync();
-                await this.fixture.Assets.EnterReadLockAsync();
-
                 // Add the quotes.
-                await aaplQuote.EnterWriteLockAsync();
-                await metaQuote.EnterWriteLockAsync();
-                await msftQuote.EnterWriteLockAsync();
                 await this.fixture.Quotes.AddAsync(aaplQuote);
                 await this.fixture.Quotes.AddAsync(metaQuote);
                 await this.fixture.Quotes.AddAsync(msftQuote);
 
                 // Commit the changes.
-                asyncTransaction.Complete();
+                asyncTransaction.Commit();
             }
 
             // Spawn the deadlocking threads.
@@ -228,7 +208,7 @@ namespace UnitTest
             Assert.Fail("After a deadlock, execution of the task should end.");
 
             // Commit the results.
-            asyncTransaction.Complete();
+            asyncTransaction.Commit();
         }
     }
 }

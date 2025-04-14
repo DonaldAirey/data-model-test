@@ -98,19 +98,14 @@ namespace UnitTest
         private readonly CancellationTokenSource? cancellationTokenSource = null;
 
         /// <summary>
+        /// The committable transaction.
+        /// </summary>
+        private readonly CommittableTransaction committableTransaction;
+
+        /// <summary>
         /// The unique identifier.
         /// </summary>
         private readonly Guid identifier = Guid.NewGuid();
-
-        /// <summary>
-        /// The transaction.
-        /// </summary>
-        private readonly Transaction? transaction;
-
-        /// <summary>
-        /// The transaction scope.
-        /// </summary>
-        private readonly TransactionScope transactionScope;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="AsyncTransaction"/> class.
@@ -119,16 +114,13 @@ namespace UnitTest
         {
             if (cancellationToken == default)
             {
-                this.cancellationTokenSource = new CancellationTokenSource();
+                this.cancellationTokenSource = new CancellationTokenSource(TimeSpan.FromSeconds(30));
                 cancellationToken = cancellationTokenSource.Token;
             }
 
             this.CancellationToken = cancellationToken;
             AsyncTransaction.asyncTransaction.Value = this;
-            this.transactionScope = new TransactionScope(TransactionScopeAsyncFlowOption.Enabled);
-            this.transaction = Transaction.Current;
-            ArgumentNullException.ThrowIfNull(this.transaction);
-            this.transaction.TransactionCompleted += this.OnTransactionCompleted;
+            this.committableTransaction = new CommittableTransaction(new TransactionOptions { Timeout = TimeSpan.MaxValue });
         }
 
         /// <summary>
@@ -163,11 +155,11 @@ namespace UnitTest
         public Dictionary<object, AsyncReaderWriterLock> WriteLocks { get; } = new Dictionary<object, AsyncReaderWriterLock>();
 
         /// <summary>
-        /// Indicates that all operations within the scope are completed successfully.
+        /// Indicates that all operations are to be committed.
         /// </summary>
-        public void Complete()
+        public void Commit()
         {
-            this.transactionScope.Complete();
+            this.committableTransaction.Commit();
         }
 
         /// <inheritdoc/>
@@ -183,7 +175,7 @@ namespace UnitTest
                 asyncReaderWriterLock.Release();
             }
 
-            this.transactionScope.Dispose();
+            this.committableTransaction.Dispose();
             AsyncTransaction.asyncTransaction.Value = null;
         }
 
@@ -194,8 +186,8 @@ namespace UnitTest
         /// <returns>An <see cref="Enlistment"/> object that describes the enlistment.</returns>
         public Enlistment EnlistVolatile(IEnlistmentNotification enlistmentNotification)
         {
-            ArgumentNullException.ThrowIfNull(this.transaction);
-            return this.transaction.EnlistVolatile(new EnlistmentNotification(enlistmentNotification), EnlistmentOptions.None);
+            ArgumentNullException.ThrowIfNull(this.committableTransaction);
+            return this.committableTransaction.EnlistVolatile(new EnlistmentNotification(enlistmentNotification), EnlistmentOptions.None);
         }
 
         /// <inheritdoc/>
@@ -211,16 +203,11 @@ namespace UnitTest
         }
 
         /// <summary>
-        /// Handles the completion of the transaction.
+        /// Indicates that all operations are to be rolled back.
         /// </summary>
-        /// <param name="sender">The object that originated the event.</param>
-        /// <param name="transactionEventArgs">The event data.</param>
-        private void OnTransactionCompleted(object? sender, TransactionEventArgs transactionEventArgs)
+        public void Rollback()
         {
-            if (this.cancellationTokenSource != null)
-            {
-                this.cancellationTokenSource.Cancel();
-            }
+            this.committableTransaction.Rollback();
         }
     }
 
@@ -290,6 +277,35 @@ namespace UnitTest
                 throw new ConstraintException(message);
             }
         }
+
+        /// <summary>
+        /// Throw a constraint exception if the value is true.
+        /// </summary>
+        /// <param name="value">The value.</param>
+        /// <param name="message">The message.</param>
+        public static void ThrowIfTrue(bool value, string message)
+        {
+            if (value)
+            {
+                throw new ConstraintException(message);
+            }
+        }
+    }
+
+    /// <summary>
+    /// The state of an <see cref="Enlistment"/>.
+    /// </summary>
+    public class EnlistmentState
+    {
+        /// <summary>
+        /// Gets the commit actions.
+        /// </summary>
+        public List<Action> CommitActions { get; } = new List<Action>();
+
+        /// <summary>
+        /// Gets the rollback actions.
+        /// </summary>
+        public List<Action> RollbackActions { get; } = new List<Action>();
     }
 
     /// <summary>
@@ -405,7 +421,7 @@ namespace UnitTest.Master
         public long RowVersion { get; set; }
 
         /// <summary>
-        /// Shallow copy of a <see cref="Account"/> row.
+        /// Deep copy of a <see cref="Account"/> row.
         /// </summary>
         /// <param name="account">The destination <see cref="Account"/> row.</param>
         public void CopyFrom(Account account)
@@ -485,14 +501,14 @@ namespace UnitTest.Master
         private readonly AsyncReaderWriterLock asyncReaderWriterLock = new AsyncReaderWriterLock();
 
         /// <summary>
-        /// The commit actions for all the concurrent transactions.
-        /// </summary>
-        private ConcurrentDictionary<AsyncTransaction, List<Action>> commitDictionary = new ConcurrentDictionary<AsyncTransaction, List<Action>>();
-
-        /// <summary>
         /// The primary index.
         /// </summary>
         private readonly Dictionary<System.Guid, Account> dictionary = new Dictionary<System.Guid, Account>();
+
+        /// <summary>
+        /// The enlistment states for all the concurrent transactions.
+        /// </summary>
+        private readonly ConcurrentDictionary<AsyncTransaction, EnlistmentState> enlistmentStates = new ConcurrentDictionary<AsyncTransaction, EnlistmentState>();
 
         /// <summary>
         /// The data model.
@@ -505,29 +521,27 @@ namespace UnitTest.Master
         public event EventHandler<RowChangedEventArgs>? RowChanged;
 
         /// <summary>
-        /// Gets the commit actions for the current task.
+        /// Gets the list of deleted rows.
         /// </summary>
-        private List<Action> CommitActions
+        public LinkedList<Account> DeletedRows { get; } = new LinkedList<Account>();
+
+        /// <summary>
+        /// Gets the enlistment state for the current task.
+        /// </summary>
+        private EnlistmentState? EnlistmentState
         {
             get
             {
                 var asyncTransaction = AsyncTransaction.Current;
-                ArgumentNullException.ThrowIfNull(asyncTransaction);
-                if (asyncTransaction.CancellationToken.IsCancellationRequested)
+                if (asyncTransaction == null)
                 {
-                    throw new OperationCanceledException();
+                    return null;
                 }
 
-                this.commitDictionary.TryGetValue(asyncTransaction, out var commitActions);
-                ArgumentNullException.ThrowIfNull(commitActions);
-                return commitActions;
+                this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+                return enlistmentState;
             }
         }
-
-        /// <summary>
-        /// Gets the list of deleted rows.
-        /// </summary>
-        public LinkedList<Account> DeletedRows { get; } = new LinkedList<Account>();
 
         /// <summary>
         /// Adds a <see cref="Account"/> row.
@@ -536,24 +550,37 @@ namespace UnitTest.Master
         /// <returns>The added <see cref="Account"/> row.</returns>
         public async Task<Account> AddAsync(Account account)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             Model? addedModel = null;
             if (account.ModelId != null)
             {
                 addedModel = this.fixture.Models.Find(account.ModelId.Value);
-                ConstraintException.ThrowIfNull(addedModel, "The action conflicted with the ModelAccountIndex constraint.");
+                ConstraintException.ThrowIfNull(addedModel, "ModelAccountIndex");
                 await addedModel.EnterWriteLockAsync().ConfigureAwait(false);
             }
 
-            this.CommitActions.Add(() =>
+            var originalRow = new Account(account);
+            account.Model = addedModel;
+            account.RowVersion = this.fixture.IncrementRowVersion();
+            if (addedModel != null)
             {
-                account.Model = addedModel;
-                account.RowVersion = this.fixture.IncrementRowVersion();
+                addedModel.Accounts.Add(account);
+            }
+
+            this.dictionary.Add(account.AccountId, account);
+            enlistmentState.RollbackActions.Add(() =>
+            {
+                account.CopyFrom(originalRow);
                 if (addedModel != null)
                 {
-                    addedModel.Accounts.Add(account);
+                    addedModel.Accounts.Remove(account);
                 }
 
-                this.dictionary.Add(account.AccountId, account);
+                this.dictionary.Remove(account.AccountId);
+            });
+            enlistmentState.CommitActions.Add(() =>
+            {
                 this.OnRowChanged(DataAction.Add, account);
             });
             return account;
@@ -566,6 +593,8 @@ namespace UnitTest.Master
         /// <returns>The added <see cref="Account"/> rows.</returns>
         public async Task<IEnumerable<Account>> AddAsync(IEnumerable<Account> accounts)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var addedRows = new List<Account>();
             foreach (var account in accounts)
             {
@@ -573,20 +602,31 @@ namespace UnitTest.Master
                 if (account.ModelId != null)
                 {
                     addedModel = this.fixture.Models.Find(account.ModelId.Value);
-                    ConstraintException.ThrowIfNull(addedModel, "The action conflicted with the ModelAccountIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedModel, "ModelAccountIndex");
                     await addedModel.EnterWriteLockAsync().ConfigureAwait(false);
                 }
 
-                this.CommitActions.Add(() =>
+                var originalRow = new Account(account);
+                account.Model = addedModel;
+                account.RowVersion = this.fixture.IncrementRowVersion();
+                if (addedModel != null)
                 {
-                    account.Model = addedModel;
-                    account.RowVersion = this.fixture.IncrementRowVersion();
+                    addedModel.Accounts.Add(account);
+                }
+
+                this.dictionary.Add(account.AccountId, account);
+                enlistmentState.RollbackActions.Add(() =>
+                {
+                    account.CopyFrom(originalRow);
                     if (addedModel != null)
                     {
-                        addedModel.Accounts.Add(account);
+                        addedModel.Accounts.Remove(account);
                     }
 
-                    this.dictionary.Add(account.AccountId, account);
+                    this.dictionary.Remove(account.AccountId);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Add, account);
                 });
                 addedRows.Add(account);
@@ -600,14 +640,14 @@ namespace UnitTest.Master
         {
             var asyncTransaction = AsyncTransaction.Current;
             ArgumentNullException.ThrowIfNull(asyncTransaction);
-            this.commitDictionary.TryGetValue(asyncTransaction, out var commitActions);
-            ArgumentNullException.ThrowIfNull(commitActions);
-            foreach (var commitAction in commitActions)
+            this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+            ArgumentNullException.ThrowIfNull(enlistmentState);
+            foreach (var commitAction in enlistmentState.CommitActions)
             {
                 commitAction();
             }
 
-            this.commitDictionary.TryRemove(asyncTransaction, out _);
+            this.enlistmentStates.TryRemove(asyncTransaction, out _);
             enlistment.Done();
         }
 
@@ -624,7 +664,7 @@ namespace UnitTest.Master
                 await this.asyncReaderWriterLock.EnterReadLockAsync(asyncTransaction.CancellationToken).ConfigureAwait(false);
                 asyncTransaction.ReadLocks.Add(this, this.asyncReaderWriterLock);
                 asyncTransaction.EnlistVolatile(this);
-                this.commitDictionary.TryAdd(asyncTransaction, new List<Action>());
+                this.enlistmentStates.TryAdd(asyncTransaction, new EnlistmentState());
             }
         }
 
@@ -649,7 +689,7 @@ namespace UnitTest.Master
                     await this.asyncReaderWriterLock.EnterWriteLockAsync(asyncTransaction.CancellationToken).ConfigureAwait(false);
                     asyncTransaction.WriteLocks.Add(this, this.asyncReaderWriterLock);
                     asyncTransaction.EnlistVolatile(this);
-                    this.commitDictionary.TryAdd(asyncTransaction, new List<Action>());
+                    this.enlistmentStates.TryAdd(asyncTransaction, new EnlistmentState());
                 }
             }
         }
@@ -699,7 +739,7 @@ namespace UnitTest.Master
                     var model = this.fixture.Models.Find(account.ModelId.Value);
                     if (model == null)
                     {
-                        throw new ConstraintException("The insert action conflicted with the constraint ModelAccountIndex");
+                        throw new ConstraintException("ModelAccountIndex");
                     }
 
                     model.Accounts.Add(account);
@@ -738,6 +778,8 @@ namespace UnitTest.Master
         /// <returns>The patched <see cref="Account"/> rows.</returns>
         public async Task<(IEnumerable<Account> AddedRows, IEnumerable<Account> UpdatedRows)> PatchAsync(IEnumerable<Account> accounts)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var addedRows = new List<Account>();
             var updatedRows = new List<Account>();
             foreach (var account in accounts)
@@ -758,27 +800,41 @@ namespace UnitTest.Master
                     if (account.ModelId != null)
                     {
                         addedModel = this.fixture.Models.Find(account.ModelId.Value);
-                        ConstraintException.ThrowIfNull(addedModel, "The action conflicted with the ModelAccountIndex constraint.");
+                        ConstraintException.ThrowIfNull(addedModel, "ModelAccountIndex");
                         await addedModel.EnterWriteLockAsync().ConfigureAwait(false);
                     }
 
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Account(foundRow);
+                    foundRow.AccountId = account.AccountId;
+                    foundRow.Model = addedModel;
+                    foundRow.ModelId = account.ModelId;
+                    foundRow.Name = account.Name;
+                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    if (removedModel != null)
                     {
-                        foundRow.AccountId = account.AccountId;
-                        foundRow.Model = addedModel;
-                        foundRow.ModelId = account.ModelId;
-                        foundRow.Name = account.Name;
-                        foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                        removedModel.Accounts.Remove(foundRow);
+                    }
+
+                    if (addedModel != null)
+                    {
+                        addedModel.Accounts.Add(foundRow);
+                    }
+
+                    enlistmentState.RollbackActions.Add(() =>
+                    {
+                        foundRow.CopyFrom(originalRow);
                         if (removedModel != null)
                         {
-                            removedModel.Accounts.Remove(account);
+                            removedModel.Accounts.Add(foundRow);
                         }
 
                         if (addedModel != null)
                         {
-                            addedModel.Accounts.Add(account);
+                            addedModel.Accounts.Remove(foundRow);
                         }
-
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Update, foundRow);
                     });
                     updatedRows.Add(foundRow);
@@ -789,20 +845,31 @@ namespace UnitTest.Master
                     if (account.ModelId != null)
                     {
                         addedModel = this.fixture.Models.Find(account.ModelId.Value);
-                        ConstraintException.ThrowIfNull(addedModel, "The action conflicted with the ModelAccountIndex constraint.");
+                        ConstraintException.ThrowIfNull(addedModel, "ModelAccountIndex");
                         await addedModel.EnterWriteLockAsync().ConfigureAwait(false);
                     }
 
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Account(account);
+                    account.Model = addedModel;
+                    account.RowVersion = this.fixture.IncrementRowVersion();
+                    if (addedModel != null)
                     {
-                        account.Model = addedModel;
-                        account.RowVersion = this.fixture.IncrementRowVersion();
+                        addedModel.Accounts.Add(account);
+                    }
+
+                    this.dictionary.Add(account.AccountId, account);
+                    enlistmentState.RollbackActions.Add(() =>
+                    {
+                        account.CopyFrom(originalRow);
                         if (addedModel != null)
                         {
-                            addedModel.Accounts.Add(account);
+                            addedModel.Accounts.Remove(account);
                         }
 
-                        this.dictionary.Add(account.AccountId, account);
+                        this.dictionary.Remove(account.AccountId);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Add, account);
                     });
                     addedRows.Add(account);
@@ -825,6 +892,8 @@ namespace UnitTest.Master
         /// <returns>The added or updated <see cref="Account"/> row.</returns>
         public async Task<(Account? AddedRow, Account? UpdatedRow)> PutAsync(Account account)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue(account.AccountId, out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
@@ -841,27 +910,41 @@ namespace UnitTest.Master
                 if (account.ModelId != null)
                 {
                     addedModel = this.fixture.Models.Find(account.ModelId.Value);
-                    ConstraintException.ThrowIfNull(addedModel, "The action conflicted with the ModelAccountIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedModel, "ModelAccountIndex");
                     await addedModel.EnterWriteLockAsync().ConfigureAwait(false);
                 }
 
-                this.CommitActions.Add(() =>
+                var originalRow = new Account(foundRow);
+                foundRow.AccountId = account.AccountId;
+                foundRow.Model = addedModel;
+                foundRow.ModelId = account.ModelId;
+                foundRow.Name = account.Name;
+                foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                if (removedModel != null)
                 {
-                    foundRow.AccountId = account.AccountId;
-                    foundRow.Model = addedModel;
-                    foundRow.ModelId = account.ModelId;
-                    foundRow.Name = account.Name;
-                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    removedModel.Accounts.Remove(foundRow);
+                }
+
+                if (addedModel != null)
+                {
+                    addedModel.Accounts.Add(foundRow);
+                }
+
+                enlistmentState.RollbackActions.Add(() =>
+                {
+                    foundRow.CopyFrom(originalRow);
                     if (removedModel != null)
                     {
-                        removedModel.Accounts.Remove(account);
+                        removedModel.Accounts.Add(foundRow);
                     }
 
                     if (addedModel != null)
                     {
-                        addedModel.Accounts.Add(account);
+                        addedModel.Accounts.Remove(foundRow);
                     }
-
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Update, foundRow);
                 });
                 return (AddedRow: null, UpdatedRow: foundRow);
@@ -872,20 +955,31 @@ namespace UnitTest.Master
                 if (account.ModelId != null)
                 {
                     addedModel = this.fixture.Models.Find(account.ModelId.Value);
-                    ConstraintException.ThrowIfNull(addedModel, "The action conflicted with the ModelAccountIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedModel, "ModelAccountIndex");
                     await addedModel.EnterWriteLockAsync().ConfigureAwait(false);
                 }
 
-                this.CommitActions.Add(() =>
+                var originalRow = new Account(account);
+                account.Model = addedModel;
+                account.RowVersion = this.fixture.IncrementRowVersion();
+                if (addedModel != null)
                 {
-                    account.Model = addedModel;
-                    account.RowVersion = this.fixture.IncrementRowVersion();
+                    addedModel.Accounts.Add(account);
+                }
+
+                this.dictionary.Add(account.AccountId, account);
+                enlistmentState.RollbackActions.Add(() =>
+                {
+                    account.CopyFrom(originalRow);
                     if (addedModel != null)
                     {
-                        addedModel.Accounts.Add(account);
+                        addedModel.Accounts.Remove(account);
                     }
 
-                    this.dictionary.Add(account.AccountId, account);
+                    this.dictionary.Remove(account.AccountId);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Add, account);
                 });
                 return (AddedRow: account, UpdatedRow: null);
@@ -899,6 +993,8 @@ namespace UnitTest.Master
         /// <returns>The removed <see cref="Account"/> rows.</returns>
         public async Task<IEnumerable<Account>> RemoveAsync(IEnumerable<Account> accounts)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var removedRows = new List<Account>();
             foreach (var account in accounts)
             {
@@ -906,6 +1002,8 @@ namespace UnitTest.Master
                 {
                     await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
                     ConcurrencyException.ThrowIfNotEqual(account.RowVersion, foundRow.RowVersion);
+                    ConstraintException.ThrowIfTrue(foundRow.Orders.Count != 0, "AccountOrderIndex");
+                    ConstraintException.ThrowIfTrue(foundRow.Positions.Count != 0, "AccountPositionIndex");
                     Model? removedModel = null;
                     if (account.ModelId != null)
                     {
@@ -914,16 +1012,27 @@ namespace UnitTest.Master
                         await removedModel.EnterWriteLockAsync().ConfigureAwait(false);
                     }
 
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Account(foundRow);
+                    foundRow.Model = null;
+                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    if (removedModel != null)
                     {
-                        foundRow.Model = null;
-                        foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                        removedModel.Accounts.Remove(foundRow);
+                    }
+
+                    this.dictionary.Remove(foundRow.AccountId);
+                    enlistmentState.RollbackActions.Add(() =>
+                    {
+                        foundRow.CopyFrom(originalRow);
                         if (removedModel != null)
                         {
-                            removedModel.Accounts.Remove(account);
+                            removedModel.Accounts.Add(foundRow);
                         }
 
-                        this.dictionary.Remove(foundRow.AccountId);
+                        this.dictionary.Add(foundRow.AccountId, foundRow);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.DeletedRows.AddFirst(foundRow);
                         this.OnRowChanged(DataAction.Remove, foundRow);
                     });
@@ -941,10 +1050,14 @@ namespace UnitTest.Master
         /// <returns>The removed <see cref="Account"/> row.</returns>
         public async Task<Account?> RemoveAsync(Account account)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue(account.AccountId, out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
                 ConcurrencyException.ThrowIfNotEqual(account.RowVersion, foundRow.RowVersion);
+                ConstraintException.ThrowIfTrue(foundRow.Orders.Count != 0, "AccountOrderIndex");
+                ConstraintException.ThrowIfTrue(foundRow.Positions.Count != 0, "AccountPositionIndex");
                 Model? removedModel = null;
                 if (account.ModelId != null)
                 {
@@ -953,16 +1066,27 @@ namespace UnitTest.Master
                     await removedModel.EnterWriteLockAsync().ConfigureAwait(false);
                 }
 
-                this.CommitActions.Add(() =>
+                var originalRow = new Account(foundRow);
+                foundRow.Model = null;
+                foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                if (removedModel != null)
                 {
-                    foundRow.Model = null;
-                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    removedModel.Accounts.Remove(foundRow);
+                }
+
+                this.dictionary.Remove(foundRow.AccountId);
+                enlistmentState.RollbackActions.Add(() =>
+                {
+                    foundRow.CopyFrom(originalRow);
                     if (removedModel != null)
                     {
-                        removedModel.Accounts.Remove(account);
+                        removedModel.Accounts.Add(foundRow);
                     }
 
-                    this.dictionary.Remove(foundRow.AccountId);
+                    this.dictionary.Add(foundRow.AccountId, foundRow);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.DeletedRows.AddFirst(foundRow);
                     this.OnRowChanged(DataAction.Remove, foundRow);
                 });
@@ -977,6 +1101,16 @@ namespace UnitTest.Master
         /// <inheritdoc/>
         public void Rollback(Enlistment enlistment)
         {
+            var asyncTransaction = AsyncTransaction.Current;
+            ArgumentNullException.ThrowIfNull(asyncTransaction);
+            this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+            ArgumentNullException.ThrowIfNull(enlistmentState);
+            foreach (var rollbackAction in enlistmentState.RollbackActions)
+            {
+                rollbackAction();
+            }
+
+            this.enlistmentStates.TryRemove(asyncTransaction, out _);
             enlistment.Done();
         }
 
@@ -986,6 +1120,8 @@ namespace UnitTest.Master
         /// <param name="accounts">The account row.</param>
         public async Task<IEnumerable<Account>> UpdateAsync(IEnumerable<Account> accounts)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var updatedRows = new List<Account>();
             foreach (var account in accounts)
             {
@@ -1005,27 +1141,41 @@ namespace UnitTest.Master
                     if (account.ModelId != null)
                     {
                         addedModel = this.fixture.Models.Find(account.ModelId.Value);
-                        ConstraintException.ThrowIfNull(addedModel, "The action conflicted with the ModelAccountIndex constraint.");
+                        ConstraintException.ThrowIfNull(addedModel, "ModelAccountIndex");
                         await addedModel.EnterWriteLockAsync().ConfigureAwait(false);
                     }
 
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Account(foundRow);
+                    foundRow.AccountId = account.AccountId;
+                    foundRow.Model = addedModel;
+                    foundRow.ModelId = account.ModelId;
+                    foundRow.Name = account.Name;
+                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    if (removedModel != null)
                     {
-                        foundRow.AccountId = account.AccountId;
-                        foundRow.Model = addedModel;
-                        foundRow.ModelId = account.ModelId;
-                        foundRow.Name = account.Name;
-                        foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                        removedModel.Accounts.Remove(foundRow);
+                    }
+
+                    if (addedModel != null)
+                    {
+                        addedModel.Accounts.Add(foundRow);
+                    }
+
+                    enlistmentState.RollbackActions.Add(() =>
+                    {
+                        foundRow.CopyFrom(originalRow);
                         if (removedModel != null)
                         {
-                            removedModel.Accounts.Remove(account);
+                            removedModel.Accounts.Add(foundRow);
                         }
 
                         if (addedModel != null)
                         {
-                            addedModel.Accounts.Add(account);
+                            addedModel.Accounts.Remove(foundRow);
                         }
-
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Update, foundRow);
                     });
                     updatedRows.Add(foundRow);
@@ -1045,6 +1195,8 @@ namespace UnitTest.Master
         /// <param name="account">The account row.</param>
         public async Task<Account> UpdateAsync(Account account)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue(account.AccountId, out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
@@ -1061,27 +1213,41 @@ namespace UnitTest.Master
                 if (account.ModelId != null)
                 {
                     addedModel = this.fixture.Models.Find(account.ModelId.Value);
-                    ConstraintException.ThrowIfNull(addedModel, "The action conflicted with the ModelAccountIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedModel, "ModelAccountIndex");
                     await addedModel.EnterWriteLockAsync().ConfigureAwait(false);
                 }
 
-                this.CommitActions.Add(() =>
+                var originalRow = new Account(foundRow);
+                foundRow.AccountId = account.AccountId;
+                foundRow.Model = addedModel;
+                foundRow.ModelId = account.ModelId;
+                foundRow.Name = account.Name;
+                foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                if (removedModel != null)
                 {
-                    foundRow.AccountId = account.AccountId;
-                    foundRow.Model = addedModel;
-                    foundRow.ModelId = account.ModelId;
-                    foundRow.Name = account.Name;
-                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    removedModel.Accounts.Remove(foundRow);
+                }
+
+                if (addedModel != null)
+                {
+                    addedModel.Accounts.Add(foundRow);
+                }
+
+                enlistmentState.RollbackActions.Add(() =>
+                {
+                    foundRow.CopyFrom(originalRow);
                     if (removedModel != null)
                     {
-                        removedModel.Accounts.Remove(account);
+                        removedModel.Accounts.Add(foundRow);
                     }
 
                     if (addedModel != null)
                     {
-                        addedModel.Accounts.Add(account);
+                        addedModel.Accounts.Remove(foundRow);
                     }
-
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Update, foundRow);
                 });
                 return foundRow;
@@ -1146,7 +1312,7 @@ namespace UnitTest.Master
                         await this.fixtureContext.SaveChangesAsync();
                     }
 
-                    asyncTransaction.Complete();
+                    asyncTransaction.Commit();
                 }
 
                 return this.Ok(account);
@@ -1194,7 +1360,7 @@ namespace UnitTest.Master
                 var deletedRows = await this.fixture.Accounts.RemoveAsync(accounts).ConfigureAwait(false);
                 this.fixtureContext.Accounts.RemoveRange(deletedRows);
                 await this.fixtureContext.SaveChangesAsync();
-                asyncTransaction.Complete();
+                asyncTransaction.Commit();
                 return this.Ok(deletedRows);
             }
             catch (ConcurrencyException concurrencyException)
@@ -1336,7 +1502,7 @@ namespace UnitTest.Master
                 this.fixtureContext.Accounts.AddRange(addedRows);
                 this.fixtureContext.Accounts.UpdateRange(updatedRows);
                 await this.fixtureContext.SaveChangesAsync().ConfigureAwait(false);
-                asyncTransaction.Complete();
+                asyncTransaction.Commit();
                 return this.Ok(addedRows.Concat(updatedRows));
             }
             catch (ConcurrencyException concurrencyException)
@@ -1385,7 +1551,7 @@ namespace UnitTest.Master
                 {
                     this.fixtureContext.Add(addedRow);
                     await this.fixtureContext.SaveChangesAsync();
-                    asyncTransaction.Complete();
+                    asyncTransaction.Commit();
                     return this.Ok(addedRow);
                 }
 
@@ -1393,7 +1559,7 @@ namespace UnitTest.Master
                 {
                     this.fixtureContext.Update(updatedRow);
                     await this.fixtureContext.SaveChangesAsync();
-                    asyncTransaction.Complete();
+                    asyncTransaction.Commit();
                     return this.Ok(updatedRow);
                 }
 
@@ -1490,7 +1656,7 @@ namespace UnitTest.Master
         public long RowVersion { get; set; }
 
         /// <summary>
-        /// Shallow copy of a <see cref="Asset"/> row.
+        /// Deep copy of a <see cref="Asset"/> row.
         /// </summary>
         /// <param name="asset">The destination <see cref="Asset"/> row.</param>
         public void CopyFrom(Asset asset)
@@ -1570,14 +1736,14 @@ namespace UnitTest.Master
         private readonly AsyncReaderWriterLock asyncReaderWriterLock = new AsyncReaderWriterLock();
 
         /// <summary>
-        /// The commit actions for all the concurrent transactions.
-        /// </summary>
-        private ConcurrentDictionary<AsyncTransaction, List<Action>> commitDictionary = new ConcurrentDictionary<AsyncTransaction, List<Action>>();
-
-        /// <summary>
         /// The primary index.
         /// </summary>
         private readonly Dictionary<System.Guid, Asset> dictionary = new Dictionary<System.Guid, Asset>();
+
+        /// <summary>
+        /// The enlistment states for all the concurrent transactions.
+        /// </summary>
+        private readonly ConcurrentDictionary<AsyncTransaction, EnlistmentState> enlistmentStates = new ConcurrentDictionary<AsyncTransaction, EnlistmentState>();
 
         /// <summary>
         /// The data model.
@@ -1590,29 +1756,27 @@ namespace UnitTest.Master
         public event EventHandler<RowChangedEventArgs>? RowChanged;
 
         /// <summary>
-        /// Gets the commit actions for the current task.
+        /// Gets the list of deleted rows.
         /// </summary>
-        private List<Action> CommitActions
+        public LinkedList<Asset> DeletedRows { get; } = new LinkedList<Asset>();
+
+        /// <summary>
+        /// Gets the enlistment state for the current task.
+        /// </summary>
+        private EnlistmentState? EnlistmentState
         {
             get
             {
                 var asyncTransaction = AsyncTransaction.Current;
-                ArgumentNullException.ThrowIfNull(asyncTransaction);
-                if (asyncTransaction.CancellationToken.IsCancellationRequested)
+                if (asyncTransaction == null)
                 {
-                    throw new OperationCanceledException();
+                    return null;
                 }
 
-                this.commitDictionary.TryGetValue(asyncTransaction, out var commitActions);
-                ArgumentNullException.ThrowIfNull(commitActions);
-                return commitActions;
+                this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+                return enlistmentState;
             }
         }
-
-        /// <summary>
-        /// Gets the list of deleted rows.
-        /// </summary>
-        public LinkedList<Asset> DeletedRows { get; } = new LinkedList<Asset>();
 
         /// <summary>
         /// Adds a <see cref="Asset"/> row.
@@ -1621,10 +1785,18 @@ namespace UnitTest.Master
         /// <returns>The added <see cref="Asset"/> row.</returns>
         public Task<Asset> AddAsync(Asset asset)
         {
-            this.CommitActions.Add(() =>
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
+            var originalRow = new Asset(asset);
+            asset.RowVersion = this.fixture.IncrementRowVersion();
+            this.dictionary.Add(asset.AssetId, asset);
+            enlistmentState.RollbackActions.Add(() =>
             {
-                asset.RowVersion = this.fixture.IncrementRowVersion();
-                this.dictionary.Add(asset.AssetId, asset);
+                asset.CopyFrom(originalRow);
+                this.dictionary.Remove(asset.AssetId);
+            });
+            enlistmentState.CommitActions.Add(() =>
+            {
                 this.OnRowChanged(DataAction.Add, asset);
             });
             return Task.FromResult(asset);
@@ -1637,13 +1809,21 @@ namespace UnitTest.Master
         /// <returns>The added <see cref="Asset"/> rows.</returns>
         public Task<IEnumerable<Asset>> AddAsync(IEnumerable<Asset> assets)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var addedRows = new List<Asset>();
             foreach (var asset in assets)
             {
-                this.CommitActions.Add(() =>
+                var originalRow = new Asset(asset);
+                asset.RowVersion = this.fixture.IncrementRowVersion();
+                this.dictionary.Add(asset.AssetId, asset);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    asset.RowVersion = this.fixture.IncrementRowVersion();
-                    this.dictionary.Add(asset.AssetId, asset);
+                    asset.CopyFrom(originalRow);
+                    this.dictionary.Remove(asset.AssetId);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Add, asset);
                 });
                 addedRows.Add(asset);
@@ -1657,14 +1837,14 @@ namespace UnitTest.Master
         {
             var asyncTransaction = AsyncTransaction.Current;
             ArgumentNullException.ThrowIfNull(asyncTransaction);
-            this.commitDictionary.TryGetValue(asyncTransaction, out var commitActions);
-            ArgumentNullException.ThrowIfNull(commitActions);
-            foreach (var commitAction in commitActions)
+            this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+            ArgumentNullException.ThrowIfNull(enlistmentState);
+            foreach (var commitAction in enlistmentState.CommitActions)
             {
                 commitAction();
             }
 
-            this.commitDictionary.TryRemove(asyncTransaction, out _);
+            this.enlistmentStates.TryRemove(asyncTransaction, out _);
             enlistment.Done();
         }
 
@@ -1681,7 +1861,7 @@ namespace UnitTest.Master
                 await this.asyncReaderWriterLock.EnterReadLockAsync(asyncTransaction.CancellationToken).ConfigureAwait(false);
                 asyncTransaction.ReadLocks.Add(this, this.asyncReaderWriterLock);
                 asyncTransaction.EnlistVolatile(this);
-                this.commitDictionary.TryAdd(asyncTransaction, new List<Action>());
+                this.enlistmentStates.TryAdd(asyncTransaction, new EnlistmentState());
             }
         }
 
@@ -1706,7 +1886,7 @@ namespace UnitTest.Master
                     await this.asyncReaderWriterLock.EnterWriteLockAsync(asyncTransaction.CancellationToken).ConfigureAwait(false);
                     asyncTransaction.WriteLocks.Add(this, this.asyncReaderWriterLock);
                     asyncTransaction.EnlistVolatile(this);
-                    this.commitDictionary.TryAdd(asyncTransaction, new List<Action>());
+                    this.enlistmentStates.TryAdd(asyncTransaction, new EnlistmentState());
                 }
             }
         }
@@ -1779,6 +1959,8 @@ namespace UnitTest.Master
         /// <returns>The patched <see cref="Asset"/> rows.</returns>
         public async Task<(IEnumerable<Asset> AddedRows, IEnumerable<Asset> UpdatedRows)> PatchAsync(IEnumerable<Asset> assets)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var addedRows = new List<Asset>();
             var updatedRows = new List<Asset>();
             foreach (var asset in assets)
@@ -1787,21 +1969,32 @@ namespace UnitTest.Master
                 {
                     await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
                     ConcurrencyException.ThrowIfNotEqual(asset.RowVersion, foundRow.RowVersion);
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Asset(foundRow);
+                    foundRow.AssetId = asset.AssetId;
+                    foundRow.Name = asset.Name;
+                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        foundRow.AssetId = asset.AssetId;
-                        foundRow.Name = asset.Name;
-                        foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                        foundRow.CopyFrom(originalRow);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Update, foundRow);
                     });
                     updatedRows.Add(foundRow);
                 }
                 else
                 {
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Asset(asset);
+                    asset.RowVersion = this.fixture.IncrementRowVersion();
+                    this.dictionary.Add(asset.AssetId, asset);
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        asset.RowVersion = this.fixture.IncrementRowVersion();
-                        this.dictionary.Add(asset.AssetId, asset);
+                        asset.CopyFrom(originalRow);
+                        this.dictionary.Remove(asset.AssetId);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Add, asset);
                     });
                     addedRows.Add(asset);
@@ -1824,25 +2017,38 @@ namespace UnitTest.Master
         /// <returns>The added or updated <see cref="Asset"/> row.</returns>
         public async Task<(Asset? AddedRow, Asset? UpdatedRow)> PutAsync(Asset asset)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue(asset.AssetId, out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
                 ConcurrencyException.ThrowIfNotEqual(asset.RowVersion, foundRow.RowVersion);
-                this.CommitActions.Add(() =>
+                var originalRow = new Asset(foundRow);
+                foundRow.AssetId = asset.AssetId;
+                foundRow.Name = asset.Name;
+                foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    foundRow.AssetId = asset.AssetId;
-                    foundRow.Name = asset.Name;
-                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    foundRow.CopyFrom(originalRow);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Update, foundRow);
                 });
                 return (AddedRow: null, UpdatedRow: foundRow);
             }
             else
             {
-                this.CommitActions.Add(() =>
+                var originalRow = new Asset(asset);
+                asset.RowVersion = this.fixture.IncrementRowVersion();
+                this.dictionary.Add(asset.AssetId, asset);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    asset.RowVersion = this.fixture.IncrementRowVersion();
-                    this.dictionary.Add(asset.AssetId, asset);
+                    asset.CopyFrom(originalRow);
+                    this.dictionary.Remove(asset.AssetId);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Add, asset);
                 });
                 return (AddedRow: asset, UpdatedRow: null);
@@ -1856,6 +2062,8 @@ namespace UnitTest.Master
         /// <returns>The removed <see cref="Asset"/> rows.</returns>
         public async Task<IEnumerable<Asset>> RemoveAsync(IEnumerable<Asset> assets)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var removedRows = new List<Asset>();
             foreach (var asset in assets)
             {
@@ -1863,10 +2071,19 @@ namespace UnitTest.Master
                 {
                     await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
                     ConcurrencyException.ThrowIfNotEqual(asset.RowVersion, foundRow.RowVersion);
-                    this.CommitActions.Add(() =>
+                    ConstraintException.ThrowIfTrue(foundRow.Orders.Count != 0, "AssetOrderIndex");
+                    ConstraintException.ThrowIfTrue(foundRow.Positions.Count != 0, "AssetPositionIndex");
+                    ConstraintException.ThrowIfTrue(foundRow.Quotes.Count != 0, "AssetQuoteIndex");
+                    var originalRow = new Asset(foundRow);
+                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    this.dictionary.Remove(foundRow.AssetId);
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        foundRow.RowVersion = this.fixture.IncrementRowVersion();
-                        this.dictionary.Remove(foundRow.AssetId);
+                        foundRow.CopyFrom(originalRow);
+                        this.dictionary.Add(foundRow.AssetId, foundRow);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.DeletedRows.AddFirst(foundRow);
                         this.OnRowChanged(DataAction.Remove, foundRow);
                     });
@@ -1884,14 +2101,25 @@ namespace UnitTest.Master
         /// <returns>The removed <see cref="Asset"/> row.</returns>
         public async Task<Asset?> RemoveAsync(Asset asset)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue(asset.AssetId, out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
                 ConcurrencyException.ThrowIfNotEqual(asset.RowVersion, foundRow.RowVersion);
-                this.CommitActions.Add(() =>
+                ConstraintException.ThrowIfTrue(foundRow.Orders.Count != 0, "AssetOrderIndex");
+                ConstraintException.ThrowIfTrue(foundRow.Positions.Count != 0, "AssetPositionIndex");
+                ConstraintException.ThrowIfTrue(foundRow.Quotes.Count != 0, "AssetQuoteIndex");
+                var originalRow = new Asset(foundRow);
+                foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                this.dictionary.Remove(foundRow.AssetId);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
-                    this.dictionary.Remove(foundRow.AssetId);
+                    foundRow.CopyFrom(originalRow);
+                    this.dictionary.Add(foundRow.AssetId, foundRow);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.DeletedRows.AddFirst(foundRow);
                     this.OnRowChanged(DataAction.Remove, foundRow);
                 });
@@ -1906,6 +2134,16 @@ namespace UnitTest.Master
         /// <inheritdoc/>
         public void Rollback(Enlistment enlistment)
         {
+            var asyncTransaction = AsyncTransaction.Current;
+            ArgumentNullException.ThrowIfNull(asyncTransaction);
+            this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+            ArgumentNullException.ThrowIfNull(enlistmentState);
+            foreach (var rollbackAction in enlistmentState.RollbackActions)
+            {
+                rollbackAction();
+            }
+
+            this.enlistmentStates.TryRemove(asyncTransaction, out _);
             enlistment.Done();
         }
 
@@ -1915,6 +2153,8 @@ namespace UnitTest.Master
         /// <param name="assets">The asset row.</param>
         public async Task<IEnumerable<Asset>> UpdateAsync(IEnumerable<Asset> assets)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var updatedRows = new List<Asset>();
             foreach (var asset in assets)
             {
@@ -1922,11 +2162,16 @@ namespace UnitTest.Master
                 {
                     await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
                     ConcurrencyException.ThrowIfNotEqual(asset.RowVersion, foundRow.RowVersion);
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Asset(foundRow);
+                    foundRow.AssetId = asset.AssetId;
+                    foundRow.Name = asset.Name;
+                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        foundRow.AssetId = asset.AssetId;
-                        foundRow.Name = asset.Name;
-                        foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                        foundRow.CopyFrom(originalRow);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Update, foundRow);
                     });
                     updatedRows.Add(foundRow);
@@ -1946,15 +2191,22 @@ namespace UnitTest.Master
         /// <param name="asset">The asset row.</param>
         public async Task<Asset> UpdateAsync(Asset asset)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue(asset.AssetId, out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
                 ConcurrencyException.ThrowIfNotEqual(asset.RowVersion, foundRow.RowVersion);
-                this.CommitActions.Add(() =>
+                var originalRow = new Asset(foundRow);
+                foundRow.AssetId = asset.AssetId;
+                foundRow.Name = asset.Name;
+                foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    foundRow.AssetId = asset.AssetId;
-                    foundRow.Name = asset.Name;
-                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    foundRow.CopyFrom(originalRow);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Update, foundRow);
                 });
                 return foundRow;
@@ -2018,7 +2270,7 @@ namespace UnitTest.Master
                         await this.fixtureContext.SaveChangesAsync();
                     }
 
-                    asyncTransaction.Complete();
+                    asyncTransaction.Commit();
                 }
 
                 return this.Ok(asset);
@@ -2065,7 +2317,7 @@ namespace UnitTest.Master
                 var deletedRows = await this.fixture.Assets.RemoveAsync(assets).ConfigureAwait(false);
                 this.fixtureContext.Assets.RemoveRange(deletedRows);
                 await this.fixtureContext.SaveChangesAsync();
-                asyncTransaction.Complete();
+                asyncTransaction.Commit();
                 return this.Ok(deletedRows);
             }
             catch (ConcurrencyException concurrencyException)
@@ -2206,7 +2458,7 @@ namespace UnitTest.Master
                 this.fixtureContext.Assets.AddRange(addedRows);
                 this.fixtureContext.Assets.UpdateRange(updatedRows);
                 await this.fixtureContext.SaveChangesAsync().ConfigureAwait(false);
-                asyncTransaction.Complete();
+                asyncTransaction.Commit();
                 return this.Ok(addedRows.Concat(updatedRows));
             }
             catch (ConcurrencyException concurrencyException)
@@ -2254,7 +2506,7 @@ namespace UnitTest.Master
                 {
                     this.fixtureContext.Add(addedRow);
                     await this.fixtureContext.SaveChangesAsync();
-                    asyncTransaction.Complete();
+                    asyncTransaction.Commit();
                     return this.Ok(addedRow);
                 }
 
@@ -2262,7 +2514,7 @@ namespace UnitTest.Master
                 {
                     this.fixtureContext.Update(updatedRow);
                     await this.fixtureContext.SaveChangesAsync();
-                    asyncTransaction.Complete();
+                    asyncTransaction.Commit();
                     return this.Ok(updatedRow);
                 }
 
@@ -2536,7 +2788,7 @@ namespace UnitTest.Master
         public long RowVersion { get; set; }
 
         /// <summary>
-        /// Shallow copy of a <see cref="Model"/> row.
+        /// Deep copy of a <see cref="Model"/> row.
         /// </summary>
         /// <param name="model">The destination <see cref="Model"/> row.</param>
         public void CopyFrom(Model model)
@@ -2612,14 +2864,14 @@ namespace UnitTest.Master
         private readonly AsyncReaderWriterLock asyncReaderWriterLock = new AsyncReaderWriterLock();
 
         /// <summary>
-        /// The commit actions for all the concurrent transactions.
-        /// </summary>
-        private ConcurrentDictionary<AsyncTransaction, List<Action>> commitDictionary = new ConcurrentDictionary<AsyncTransaction, List<Action>>();
-
-        /// <summary>
         /// The primary index.
         /// </summary>
         private readonly Dictionary<System.Guid, Model> dictionary = new Dictionary<System.Guid, Model>();
+
+        /// <summary>
+        /// The enlistment states for all the concurrent transactions.
+        /// </summary>
+        private readonly ConcurrentDictionary<AsyncTransaction, EnlistmentState> enlistmentStates = new ConcurrentDictionary<AsyncTransaction, EnlistmentState>();
 
         /// <summary>
         /// The data model.
@@ -2632,29 +2884,27 @@ namespace UnitTest.Master
         public event EventHandler<RowChangedEventArgs>? RowChanged;
 
         /// <summary>
-        /// Gets the commit actions for the current task.
+        /// Gets the list of deleted rows.
         /// </summary>
-        private List<Action> CommitActions
+        public LinkedList<Model> DeletedRows { get; } = new LinkedList<Model>();
+
+        /// <summary>
+        /// Gets the enlistment state for the current task.
+        /// </summary>
+        private EnlistmentState? EnlistmentState
         {
             get
             {
                 var asyncTransaction = AsyncTransaction.Current;
-                ArgumentNullException.ThrowIfNull(asyncTransaction);
-                if (asyncTransaction.CancellationToken.IsCancellationRequested)
+                if (asyncTransaction == null)
                 {
-                    throw new OperationCanceledException();
+                    return null;
                 }
 
-                this.commitDictionary.TryGetValue(asyncTransaction, out var commitActions);
-                ArgumentNullException.ThrowIfNull(commitActions);
-                return commitActions;
+                this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+                return enlistmentState;
             }
         }
-
-        /// <summary>
-        /// Gets the list of deleted rows.
-        /// </summary>
-        public LinkedList<Model> DeletedRows { get; } = new LinkedList<Model>();
 
         /// <summary>
         /// Adds a <see cref="Model"/> row.
@@ -2663,10 +2913,18 @@ namespace UnitTest.Master
         /// <returns>The added <see cref="Model"/> row.</returns>
         public Task<Model> AddAsync(Model model)
         {
-            this.CommitActions.Add(() =>
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
+            var originalRow = new Model(model);
+            model.RowVersion = this.fixture.IncrementRowVersion();
+            this.dictionary.Add(model.ModelId, model);
+            enlistmentState.RollbackActions.Add(() =>
             {
-                model.RowVersion = this.fixture.IncrementRowVersion();
-                this.dictionary.Add(model.ModelId, model);
+                model.CopyFrom(originalRow);
+                this.dictionary.Remove(model.ModelId);
+            });
+            enlistmentState.CommitActions.Add(() =>
+            {
                 this.OnRowChanged(DataAction.Add, model);
             });
             return Task.FromResult(model);
@@ -2679,13 +2937,21 @@ namespace UnitTest.Master
         /// <returns>The added <see cref="Model"/> rows.</returns>
         public Task<IEnumerable<Model>> AddAsync(IEnumerable<Model> models)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var addedRows = new List<Model>();
             foreach (var model in models)
             {
-                this.CommitActions.Add(() =>
+                var originalRow = new Model(model);
+                model.RowVersion = this.fixture.IncrementRowVersion();
+                this.dictionary.Add(model.ModelId, model);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    model.RowVersion = this.fixture.IncrementRowVersion();
-                    this.dictionary.Add(model.ModelId, model);
+                    model.CopyFrom(originalRow);
+                    this.dictionary.Remove(model.ModelId);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Add, model);
                 });
                 addedRows.Add(model);
@@ -2699,14 +2965,14 @@ namespace UnitTest.Master
         {
             var asyncTransaction = AsyncTransaction.Current;
             ArgumentNullException.ThrowIfNull(asyncTransaction);
-            this.commitDictionary.TryGetValue(asyncTransaction, out var commitActions);
-            ArgumentNullException.ThrowIfNull(commitActions);
-            foreach (var commitAction in commitActions)
+            this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+            ArgumentNullException.ThrowIfNull(enlistmentState);
+            foreach (var commitAction in enlistmentState.CommitActions)
             {
                 commitAction();
             }
 
-            this.commitDictionary.TryRemove(asyncTransaction, out _);
+            this.enlistmentStates.TryRemove(asyncTransaction, out _);
             enlistment.Done();
         }
 
@@ -2723,7 +2989,7 @@ namespace UnitTest.Master
                 await this.asyncReaderWriterLock.EnterReadLockAsync(asyncTransaction.CancellationToken).ConfigureAwait(false);
                 asyncTransaction.ReadLocks.Add(this, this.asyncReaderWriterLock);
                 asyncTransaction.EnlistVolatile(this);
-                this.commitDictionary.TryAdd(asyncTransaction, new List<Action>());
+                this.enlistmentStates.TryAdd(asyncTransaction, new EnlistmentState());
             }
         }
 
@@ -2748,7 +3014,7 @@ namespace UnitTest.Master
                     await this.asyncReaderWriterLock.EnterWriteLockAsync(asyncTransaction.CancellationToken).ConfigureAwait(false);
                     asyncTransaction.WriteLocks.Add(this, this.asyncReaderWriterLock);
                     asyncTransaction.EnlistVolatile(this);
-                    this.commitDictionary.TryAdd(asyncTransaction, new List<Action>());
+                    this.enlistmentStates.TryAdd(asyncTransaction, new EnlistmentState());
                 }
             }
         }
@@ -2821,6 +3087,8 @@ namespace UnitTest.Master
         /// <returns>The patched <see cref="Model"/> rows.</returns>
         public async Task<(IEnumerable<Model> AddedRows, IEnumerable<Model> UpdatedRows)> PatchAsync(IEnumerable<Model> models)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var addedRows = new List<Model>();
             var updatedRows = new List<Model>();
             foreach (var model in models)
@@ -2829,21 +3097,32 @@ namespace UnitTest.Master
                 {
                     await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
                     ConcurrencyException.ThrowIfNotEqual(model.RowVersion, foundRow.RowVersion);
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Model(foundRow);
+                    foundRow.ModelId = model.ModelId;
+                    foundRow.Name = model.Name;
+                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        foundRow.ModelId = model.ModelId;
-                        foundRow.Name = model.Name;
-                        foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                        foundRow.CopyFrom(originalRow);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Update, foundRow);
                     });
                     updatedRows.Add(foundRow);
                 }
                 else
                 {
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Model(model);
+                    model.RowVersion = this.fixture.IncrementRowVersion();
+                    this.dictionary.Add(model.ModelId, model);
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        model.RowVersion = this.fixture.IncrementRowVersion();
-                        this.dictionary.Add(model.ModelId, model);
+                        model.CopyFrom(originalRow);
+                        this.dictionary.Remove(model.ModelId);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Add, model);
                     });
                     addedRows.Add(model);
@@ -2866,25 +3145,38 @@ namespace UnitTest.Master
         /// <returns>The added or updated <see cref="Model"/> row.</returns>
         public async Task<(Model? AddedRow, Model? UpdatedRow)> PutAsync(Model model)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue(model.ModelId, out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
                 ConcurrencyException.ThrowIfNotEqual(model.RowVersion, foundRow.RowVersion);
-                this.CommitActions.Add(() =>
+                var originalRow = new Model(foundRow);
+                foundRow.ModelId = model.ModelId;
+                foundRow.Name = model.Name;
+                foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    foundRow.ModelId = model.ModelId;
-                    foundRow.Name = model.Name;
-                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    foundRow.CopyFrom(originalRow);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Update, foundRow);
                 });
                 return (AddedRow: null, UpdatedRow: foundRow);
             }
             else
             {
-                this.CommitActions.Add(() =>
+                var originalRow = new Model(model);
+                model.RowVersion = this.fixture.IncrementRowVersion();
+                this.dictionary.Add(model.ModelId, model);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    model.RowVersion = this.fixture.IncrementRowVersion();
-                    this.dictionary.Add(model.ModelId, model);
+                    model.CopyFrom(originalRow);
+                    this.dictionary.Remove(model.ModelId);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Add, model);
                 });
                 return (AddedRow: model, UpdatedRow: null);
@@ -2898,6 +3190,8 @@ namespace UnitTest.Master
         /// <returns>The removed <see cref="Model"/> rows.</returns>
         public async Task<IEnumerable<Model>> RemoveAsync(IEnumerable<Model> models)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var removedRows = new List<Model>();
             foreach (var model in models)
             {
@@ -2905,10 +3199,17 @@ namespace UnitTest.Master
                 {
                     await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
                     ConcurrencyException.ThrowIfNotEqual(model.RowVersion, foundRow.RowVersion);
-                    this.CommitActions.Add(() =>
+                    ConstraintException.ThrowIfTrue(foundRow.Accounts.Count != 0, "ModelAccountIndex");
+                    var originalRow = new Model(foundRow);
+                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    this.dictionary.Remove(foundRow.ModelId);
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        foundRow.RowVersion = this.fixture.IncrementRowVersion();
-                        this.dictionary.Remove(foundRow.ModelId);
+                        foundRow.CopyFrom(originalRow);
+                        this.dictionary.Add(foundRow.ModelId, foundRow);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.DeletedRows.AddFirst(foundRow);
                         this.OnRowChanged(DataAction.Remove, foundRow);
                     });
@@ -2926,14 +3227,23 @@ namespace UnitTest.Master
         /// <returns>The removed <see cref="Model"/> row.</returns>
         public async Task<Model?> RemoveAsync(Model model)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue(model.ModelId, out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
                 ConcurrencyException.ThrowIfNotEqual(model.RowVersion, foundRow.RowVersion);
-                this.CommitActions.Add(() =>
+                ConstraintException.ThrowIfTrue(foundRow.Accounts.Count != 0, "ModelAccountIndex");
+                var originalRow = new Model(foundRow);
+                foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                this.dictionary.Remove(foundRow.ModelId);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
-                    this.dictionary.Remove(foundRow.ModelId);
+                    foundRow.CopyFrom(originalRow);
+                    this.dictionary.Add(foundRow.ModelId, foundRow);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.DeletedRows.AddFirst(foundRow);
                     this.OnRowChanged(DataAction.Remove, foundRow);
                 });
@@ -2948,6 +3258,16 @@ namespace UnitTest.Master
         /// <inheritdoc/>
         public void Rollback(Enlistment enlistment)
         {
+            var asyncTransaction = AsyncTransaction.Current;
+            ArgumentNullException.ThrowIfNull(asyncTransaction);
+            this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+            ArgumentNullException.ThrowIfNull(enlistmentState);
+            foreach (var rollbackAction in enlistmentState.RollbackActions)
+            {
+                rollbackAction();
+            }
+
+            this.enlistmentStates.TryRemove(asyncTransaction, out _);
             enlistment.Done();
         }
 
@@ -2957,6 +3277,8 @@ namespace UnitTest.Master
         /// <param name="models">The model row.</param>
         public async Task<IEnumerable<Model>> UpdateAsync(IEnumerable<Model> models)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var updatedRows = new List<Model>();
             foreach (var model in models)
             {
@@ -2964,11 +3286,16 @@ namespace UnitTest.Master
                 {
                     await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
                     ConcurrencyException.ThrowIfNotEqual(model.RowVersion, foundRow.RowVersion);
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Model(foundRow);
+                    foundRow.ModelId = model.ModelId;
+                    foundRow.Name = model.Name;
+                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        foundRow.ModelId = model.ModelId;
-                        foundRow.Name = model.Name;
-                        foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                        foundRow.CopyFrom(originalRow);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Update, foundRow);
                     });
                     updatedRows.Add(foundRow);
@@ -2988,15 +3315,22 @@ namespace UnitTest.Master
         /// <param name="model">The model row.</param>
         public async Task<Model> UpdateAsync(Model model)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue(model.ModelId, out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
                 ConcurrencyException.ThrowIfNotEqual(model.RowVersion, foundRow.RowVersion);
-                this.CommitActions.Add(() =>
+                var originalRow = new Model(foundRow);
+                foundRow.ModelId = model.ModelId;
+                foundRow.Name = model.Name;
+                foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    foundRow.ModelId = model.ModelId;
-                    foundRow.Name = model.Name;
-                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    foundRow.CopyFrom(originalRow);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Update, foundRow);
                 });
                 return foundRow;
@@ -3060,7 +3394,7 @@ namespace UnitTest.Master
                         await this.fixtureContext.SaveChangesAsync();
                     }
 
-                    asyncTransaction.Complete();
+                    asyncTransaction.Commit();
                 }
 
                 return this.Ok(model);
@@ -3107,7 +3441,7 @@ namespace UnitTest.Master
                 var deletedRows = await this.fixture.Models.RemoveAsync(models).ConfigureAwait(false);
                 this.fixtureContext.Models.RemoveRange(deletedRows);
                 await this.fixtureContext.SaveChangesAsync();
-                asyncTransaction.Complete();
+                asyncTransaction.Commit();
                 return this.Ok(deletedRows);
             }
             catch (ConcurrencyException concurrencyException)
@@ -3248,7 +3582,7 @@ namespace UnitTest.Master
                 this.fixtureContext.Models.AddRange(addedRows);
                 this.fixtureContext.Models.UpdateRange(updatedRows);
                 await this.fixtureContext.SaveChangesAsync().ConfigureAwait(false);
-                asyncTransaction.Complete();
+                asyncTransaction.Commit();
                 return this.Ok(addedRows.Concat(updatedRows));
             }
             catch (ConcurrencyException concurrencyException)
@@ -3296,7 +3630,7 @@ namespace UnitTest.Master
                 {
                     this.fixtureContext.Add(addedRow);
                     await this.fixtureContext.SaveChangesAsync();
-                    asyncTransaction.Complete();
+                    asyncTransaction.Commit();
                     return this.Ok(addedRow);
                 }
 
@@ -3304,7 +3638,7 @@ namespace UnitTest.Master
                 {
                     this.fixtureContext.Update(updatedRow);
                     await this.fixtureContext.SaveChangesAsync();
-                    asyncTransaction.Complete();
+                    asyncTransaction.Commit();
                     return this.Ok(updatedRow);
                 }
 
@@ -3416,7 +3750,7 @@ namespace UnitTest.Master
         public long RowVersion { get; set; }
 
         /// <summary>
-        /// Shallow copy of a <see cref="Order"/> row.
+        /// Deep copy of a <see cref="Order"/> row.
         /// </summary>
         /// <param name="order">The destination <see cref="Order"/> row.</param>
         public void CopyFrom(Order order)
@@ -3493,14 +3827,14 @@ namespace UnitTest.Master
         private readonly AsyncReaderWriterLock asyncReaderWriterLock = new AsyncReaderWriterLock();
 
         /// <summary>
-        /// The commit actions for all the concurrent transactions.
-        /// </summary>
-        private ConcurrentDictionary<AsyncTransaction, List<Action>> commitDictionary = new ConcurrentDictionary<AsyncTransaction, List<Action>>();
-
-        /// <summary>
         /// The primary index.
         /// </summary>
         private readonly Dictionary<(System.Guid, System.Guid), Order> dictionary = new Dictionary<(System.Guid, System.Guid), Order>();
+
+        /// <summary>
+        /// The enlistment states for all the concurrent transactions.
+        /// </summary>
+        private readonly ConcurrentDictionary<AsyncTransaction, EnlistmentState> enlistmentStates = new ConcurrentDictionary<AsyncTransaction, EnlistmentState>();
 
         /// <summary>
         /// The data model.
@@ -3513,29 +3847,27 @@ namespace UnitTest.Master
         public event EventHandler<RowChangedEventArgs>? RowChanged;
 
         /// <summary>
-        /// Gets the commit actions for the current task.
+        /// Gets the list of deleted rows.
         /// </summary>
-        private List<Action> CommitActions
+        public LinkedList<Order> DeletedRows { get; } = new LinkedList<Order>();
+
+        /// <summary>
+        /// Gets the enlistment state for the current task.
+        /// </summary>
+        private EnlistmentState? EnlistmentState
         {
             get
             {
                 var asyncTransaction = AsyncTransaction.Current;
-                ArgumentNullException.ThrowIfNull(asyncTransaction);
-                if (asyncTransaction.CancellationToken.IsCancellationRequested)
+                if (asyncTransaction == null)
                 {
-                    throw new OperationCanceledException();
+                    return null;
                 }
 
-                this.commitDictionary.TryGetValue(asyncTransaction, out var commitActions);
-                ArgumentNullException.ThrowIfNull(commitActions);
-                return commitActions;
+                this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+                return enlistmentState;
             }
         }
-
-        /// <summary>
-        /// Gets the list of deleted rows.
-        /// </summary>
-        public LinkedList<Order> DeletedRows { get; } = new LinkedList<Order>();
 
         /// <summary>
         /// Adds a <see cref="Order"/> row.
@@ -3544,20 +3876,30 @@ namespace UnitTest.Master
         /// <returns>The added <see cref="Order"/> row.</returns>
         public async Task<Order> AddAsync(Order order)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var addedAccount = this.fixture.Accounts.Find(order.AccountId);
-            ConstraintException.ThrowIfNull(addedAccount, "The action conflicted with the AccountOrderIndex constraint.");
+            ConstraintException.ThrowIfNull(addedAccount, "AccountOrderIndex");
             await addedAccount.EnterWriteLockAsync().ConfigureAwait(false);
             var addedAsset = this.fixture.Assets.Find(order.AssetId);
-            ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetOrderIndex constraint.");
+            ConstraintException.ThrowIfNull(addedAsset, "AssetOrderIndex");
             await addedAsset.EnterWriteLockAsync().ConfigureAwait(false);
-            this.CommitActions.Add(() =>
+            var originalRow = new Order(order);
+            order.Account = addedAccount;
+            order.Asset = addedAsset;
+            order.RowVersion = this.fixture.IncrementRowVersion();
+            addedAccount.Orders.Add(order);
+            addedAsset.Orders.Add(order);
+            this.dictionary.Add((order.AccountId, order.AssetId), order);
+            enlistmentState.RollbackActions.Add(() =>
             {
-                order.Account = addedAccount;
-                order.Asset = addedAsset;
-                order.RowVersion = this.fixture.IncrementRowVersion();
-                addedAccount.Orders.Add(order);
-                addedAsset.Orders.Add(order);
-                this.dictionary.Add((order.AccountId, order.AssetId), order);
+                order.CopyFrom(originalRow);
+                addedAccount.Orders.Remove(order);
+                addedAsset.Orders.Remove(order);
+                this.dictionary.Remove((order.AccountId, order.AssetId));
+            });
+            enlistmentState.CommitActions.Add(() =>
+            {
                 this.OnRowChanged(DataAction.Add, order);
             });
             return order;
@@ -3570,23 +3912,33 @@ namespace UnitTest.Master
         /// <returns>The added <see cref="Order"/> rows.</returns>
         public async Task<IEnumerable<Order>> AddAsync(IEnumerable<Order> orders)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var addedRows = new List<Order>();
             foreach (var order in orders)
             {
                 var addedAccount = this.fixture.Accounts.Find(order.AccountId);
-                ConstraintException.ThrowIfNull(addedAccount, "The action conflicted with the AccountOrderIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAccount, "AccountOrderIndex");
                 await addedAccount.EnterWriteLockAsync().ConfigureAwait(false);
                 var addedAsset = this.fixture.Assets.Find(order.AssetId);
-                ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetOrderIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAsset, "AssetOrderIndex");
                 await addedAsset.EnterWriteLockAsync().ConfigureAwait(false);
-                this.CommitActions.Add(() =>
+                var originalRow = new Order(order);
+                order.Account = addedAccount;
+                order.Asset = addedAsset;
+                order.RowVersion = this.fixture.IncrementRowVersion();
+                addedAccount.Orders.Add(order);
+                addedAsset.Orders.Add(order);
+                this.dictionary.Add((order.AccountId, order.AssetId), order);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    order.Account = addedAccount;
-                    order.Asset = addedAsset;
-                    order.RowVersion = this.fixture.IncrementRowVersion();
-                    addedAccount.Orders.Add(order);
-                    addedAsset.Orders.Add(order);
-                    this.dictionary.Add((order.AccountId, order.AssetId), order);
+                    order.CopyFrom(originalRow);
+                    addedAccount.Orders.Remove(order);
+                    addedAsset.Orders.Remove(order);
+                    this.dictionary.Remove((order.AccountId, order.AssetId));
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Add, order);
                 });
                 addedRows.Add(order);
@@ -3600,14 +3952,14 @@ namespace UnitTest.Master
         {
             var asyncTransaction = AsyncTransaction.Current;
             ArgumentNullException.ThrowIfNull(asyncTransaction);
-            this.commitDictionary.TryGetValue(asyncTransaction, out var commitActions);
-            ArgumentNullException.ThrowIfNull(commitActions);
-            foreach (var commitAction in commitActions)
+            this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+            ArgumentNullException.ThrowIfNull(enlistmentState);
+            foreach (var commitAction in enlistmentState.CommitActions)
             {
                 commitAction();
             }
 
-            this.commitDictionary.TryRemove(asyncTransaction, out _);
+            this.enlistmentStates.TryRemove(asyncTransaction, out _);
             enlistment.Done();
         }
 
@@ -3624,7 +3976,7 @@ namespace UnitTest.Master
                 await this.asyncReaderWriterLock.EnterReadLockAsync(asyncTransaction.CancellationToken).ConfigureAwait(false);
                 asyncTransaction.ReadLocks.Add(this, this.asyncReaderWriterLock);
                 asyncTransaction.EnlistVolatile(this);
-                this.commitDictionary.TryAdd(asyncTransaction, new List<Action>());
+                this.enlistmentStates.TryAdd(asyncTransaction, new EnlistmentState());
             }
         }
 
@@ -3649,7 +4001,7 @@ namespace UnitTest.Master
                     await this.asyncReaderWriterLock.EnterWriteLockAsync(asyncTransaction.CancellationToken).ConfigureAwait(false);
                     asyncTransaction.WriteLocks.Add(this, this.asyncReaderWriterLock);
                     asyncTransaction.EnlistVolatile(this);
-                    this.commitDictionary.TryAdd(asyncTransaction, new List<Action>());
+                    this.enlistmentStates.TryAdd(asyncTransaction, new EnlistmentState());
                 }
             }
         }
@@ -3694,7 +4046,7 @@ namespace UnitTest.Master
                 var account = this.fixture.Accounts.Find(order.AccountId);
                 if (account == null)
                 {
-                    throw new ConstraintException("The insert action conflicted with the constraint AccountOrderIndex");
+                    throw new ConstraintException("AccountOrderIndex");
                 }
 
                 account.Orders.Add(order);
@@ -3702,7 +4054,7 @@ namespace UnitTest.Master
                 var asset = this.fixture.Assets.Find(order.AssetId);
                 if (asset == null)
                 {
-                    throw new ConstraintException("The insert action conflicted with the constraint AssetOrderIndex");
+                    throw new ConstraintException("AssetOrderIndex");
                 }
 
                 asset.Orders.Add(order);
@@ -3739,6 +4091,8 @@ namespace UnitTest.Master
         /// <returns>The patched <see cref="Order"/> rows.</returns>
         public async Task<(IEnumerable<Order> AddedRows, IEnumerable<Order> UpdatedRows)> PatchAsync(IEnumerable<Order> orders)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var addedRows = new List<Order>();
             var updatedRows = new List<Order>();
             foreach (var order in orders)
@@ -3754,23 +4108,32 @@ namespace UnitTest.Master
                     ArgumentNullException.ThrowIfNull(removedAsset);
                     await removedAsset.EnterWriteLockAsync().ConfigureAwait(false);
                     var addedAccount = this.fixture.Accounts.Find(order.AccountId);
-                    ConstraintException.ThrowIfNull(addedAccount, "The action conflicted with the AccountOrderIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedAccount, "AccountOrderIndex");
                     await addedAccount.EnterWriteLockAsync().ConfigureAwait(false);
                     var addedAsset = this.fixture.Assets.Find(order.AssetId);
-                    ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetOrderIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedAsset, "AssetOrderIndex");
                     await addedAsset.EnterWriteLockAsync().ConfigureAwait(false);
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Order(foundRow);
+                    foundRow.Account = addedAccount;
+                    foundRow.AccountId = order.AccountId;
+                    foundRow.Asset = addedAsset;
+                    foundRow.AssetId = order.AssetId;
+                    foundRow.Quantity = order.Quantity;
+                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    removedAccount.Orders.Remove(foundRow);
+                    removedAsset.Orders.Remove(foundRow);
+                    addedAccount.Orders.Add(foundRow);
+                    addedAsset.Orders.Add(foundRow);
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        foundRow.Account = addedAccount;
-                        foundRow.AccountId = order.AccountId;
-                        foundRow.Asset = addedAsset;
-                        foundRow.AssetId = order.AssetId;
-                        foundRow.Quantity = order.Quantity;
-                        foundRow.RowVersion = this.fixture.IncrementRowVersion();
-                        removedAccount.Orders.Remove(order);
-                        removedAsset.Orders.Remove(order);
-                        addedAccount.Orders.Add(order);
-                        addedAsset.Orders.Add(order);
+                        foundRow.CopyFrom(originalRow);
+                        removedAccount.Orders.Add(foundRow);
+                        removedAsset.Orders.Add(foundRow);
+                        addedAccount.Orders.Remove(foundRow);
+                        addedAsset.Orders.Remove(foundRow);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Update, foundRow);
                     });
                     updatedRows.Add(foundRow);
@@ -3778,19 +4141,27 @@ namespace UnitTest.Master
                 else
                 {
                     var addedAccount = this.fixture.Accounts.Find(order.AccountId);
-                    ConstraintException.ThrowIfNull(addedAccount, "The action conflicted with the AccountOrderIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedAccount, "AccountOrderIndex");
                     await addedAccount.EnterWriteLockAsync().ConfigureAwait(false);
                     var addedAsset = this.fixture.Assets.Find(order.AssetId);
-                    ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetOrderIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedAsset, "AssetOrderIndex");
                     await addedAsset.EnterWriteLockAsync().ConfigureAwait(false);
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Order(order);
+                    order.Account = addedAccount;
+                    order.Asset = addedAsset;
+                    order.RowVersion = this.fixture.IncrementRowVersion();
+                    addedAccount.Orders.Add(order);
+                    addedAsset.Orders.Add(order);
+                    this.dictionary.Add((order.AccountId, order.AssetId), order);
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        order.Account = addedAccount;
-                        order.Asset = addedAsset;
-                        order.RowVersion = this.fixture.IncrementRowVersion();
-                        addedAccount.Orders.Add(order);
-                        addedAsset.Orders.Add(order);
-                        this.dictionary.Add((order.AccountId, order.AssetId), order);
+                        order.CopyFrom(originalRow);
+                        addedAccount.Orders.Remove(order);
+                        addedAsset.Orders.Remove(order);
+                        this.dictionary.Remove((order.AccountId, order.AssetId));
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Add, order);
                     });
                     addedRows.Add(order);
@@ -3813,6 +4184,8 @@ namespace UnitTest.Master
         /// <returns>The added or updated <see cref="Order"/> row.</returns>
         public async Task<(Order? AddedRow, Order? UpdatedRow)> PutAsync(Order order)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue((order.AccountId, order.AssetId), out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
@@ -3824,23 +4197,32 @@ namespace UnitTest.Master
                 ArgumentNullException.ThrowIfNull(removedAsset);
                 await removedAsset.EnterWriteLockAsync().ConfigureAwait(false);
                 var addedAccount = this.fixture.Accounts.Find(order.AccountId);
-                ConstraintException.ThrowIfNull(addedAccount, "The action conflicted with the AccountOrderIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAccount, "AccountOrderIndex");
                 await addedAccount.EnterWriteLockAsync().ConfigureAwait(false);
                 var addedAsset = this.fixture.Assets.Find(order.AssetId);
-                ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetOrderIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAsset, "AssetOrderIndex");
                 await addedAsset.EnterWriteLockAsync().ConfigureAwait(false);
-                this.CommitActions.Add(() =>
+                var originalRow = new Order(foundRow);
+                foundRow.Account = addedAccount;
+                foundRow.AccountId = order.AccountId;
+                foundRow.Asset = addedAsset;
+                foundRow.AssetId = order.AssetId;
+                foundRow.Quantity = order.Quantity;
+                foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                removedAccount.Orders.Remove(foundRow);
+                removedAsset.Orders.Remove(foundRow);
+                addedAccount.Orders.Add(foundRow);
+                addedAsset.Orders.Add(foundRow);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    foundRow.Account = addedAccount;
-                    foundRow.AccountId = order.AccountId;
-                    foundRow.Asset = addedAsset;
-                    foundRow.AssetId = order.AssetId;
-                    foundRow.Quantity = order.Quantity;
-                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
-                    removedAccount.Orders.Remove(order);
-                    removedAsset.Orders.Remove(order);
-                    addedAccount.Orders.Add(order);
-                    addedAsset.Orders.Add(order);
+                    foundRow.CopyFrom(originalRow);
+                    removedAccount.Orders.Add(foundRow);
+                    removedAsset.Orders.Add(foundRow);
+                    addedAccount.Orders.Remove(foundRow);
+                    addedAsset.Orders.Remove(foundRow);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Update, foundRow);
                 });
                 return (AddedRow: null, UpdatedRow: foundRow);
@@ -3848,19 +4230,27 @@ namespace UnitTest.Master
             else
             {
                 var addedAccount = this.fixture.Accounts.Find(order.AccountId);
-                ConstraintException.ThrowIfNull(addedAccount, "The action conflicted with the AccountOrderIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAccount, "AccountOrderIndex");
                 await addedAccount.EnterWriteLockAsync().ConfigureAwait(false);
                 var addedAsset = this.fixture.Assets.Find(order.AssetId);
-                ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetOrderIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAsset, "AssetOrderIndex");
                 await addedAsset.EnterWriteLockAsync().ConfigureAwait(false);
-                this.CommitActions.Add(() =>
+                var originalRow = new Order(order);
+                order.Account = addedAccount;
+                order.Asset = addedAsset;
+                order.RowVersion = this.fixture.IncrementRowVersion();
+                addedAccount.Orders.Add(order);
+                addedAsset.Orders.Add(order);
+                this.dictionary.Add((order.AccountId, order.AssetId), order);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    order.Account = addedAccount;
-                    order.Asset = addedAsset;
-                    order.RowVersion = this.fixture.IncrementRowVersion();
-                    addedAccount.Orders.Add(order);
-                    addedAsset.Orders.Add(order);
-                    this.dictionary.Add((order.AccountId, order.AssetId), order);
+                    order.CopyFrom(originalRow);
+                    addedAccount.Orders.Remove(order);
+                    addedAsset.Orders.Remove(order);
+                    this.dictionary.Remove((order.AccountId, order.AssetId));
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Add, order);
                 });
                 return (AddedRow: order, UpdatedRow: null);
@@ -3874,6 +4264,8 @@ namespace UnitTest.Master
         /// <returns>The removed <see cref="Order"/> rows.</returns>
         public async Task<IEnumerable<Order>> RemoveAsync(IEnumerable<Order> orders)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var removedRows = new List<Order>();
             foreach (var order in orders)
             {
@@ -3887,14 +4279,22 @@ namespace UnitTest.Master
                     var removedAsset = this.fixture.Assets.Find(order.AssetId);
                     ArgumentNullException.ThrowIfNull(removedAsset);
                     await removedAsset.EnterWriteLockAsync().ConfigureAwait(false);
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Order(foundRow);
+                    foundRow.Account = null;
+                    foundRow.Asset = null;
+                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    removedAccount.Orders.Remove(foundRow);
+                    removedAsset.Orders.Remove(foundRow);
+                    this.dictionary.Remove((foundRow.AccountId, foundRow.AssetId));
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        foundRow.Account = null;
-                        foundRow.Asset = null;
-                        foundRow.RowVersion = this.fixture.IncrementRowVersion();
-                        removedAccount.Orders.Remove(order);
-                        removedAsset.Orders.Remove(order);
-                        this.dictionary.Remove((foundRow.AccountId, foundRow.AssetId));
+                        foundRow.CopyFrom(originalRow);
+                        removedAccount.Orders.Add(foundRow);
+                        removedAsset.Orders.Add(foundRow);
+                        this.dictionary.Add((foundRow.AccountId, foundRow.AssetId), foundRow);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.DeletedRows.AddFirst(foundRow);
                         this.OnRowChanged(DataAction.Remove, foundRow);
                     });
@@ -3912,6 +4312,8 @@ namespace UnitTest.Master
         /// <returns>The removed <see cref="Order"/> row.</returns>
         public async Task<Order?> RemoveAsync(Order order)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue((order.AccountId, order.AssetId), out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
@@ -3922,14 +4324,22 @@ namespace UnitTest.Master
                 var removedAsset = this.fixture.Assets.Find(order.AssetId);
                 ArgumentNullException.ThrowIfNull(removedAsset);
                 await removedAsset.EnterWriteLockAsync().ConfigureAwait(false);
-                this.CommitActions.Add(() =>
+                var originalRow = new Order(foundRow);
+                foundRow.Account = null;
+                foundRow.Asset = null;
+                foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                removedAccount.Orders.Remove(foundRow);
+                removedAsset.Orders.Remove(foundRow);
+                this.dictionary.Remove((foundRow.AccountId, foundRow.AssetId));
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    foundRow.Account = null;
-                    foundRow.Asset = null;
-                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
-                    removedAccount.Orders.Remove(order);
-                    removedAsset.Orders.Remove(order);
-                    this.dictionary.Remove((foundRow.AccountId, foundRow.AssetId));
+                    foundRow.CopyFrom(originalRow);
+                    removedAccount.Orders.Add(foundRow);
+                    removedAsset.Orders.Add(foundRow);
+                    this.dictionary.Add((foundRow.AccountId, foundRow.AssetId), foundRow);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.DeletedRows.AddFirst(foundRow);
                     this.OnRowChanged(DataAction.Remove, foundRow);
                 });
@@ -3944,6 +4354,16 @@ namespace UnitTest.Master
         /// <inheritdoc/>
         public void Rollback(Enlistment enlistment)
         {
+            var asyncTransaction = AsyncTransaction.Current;
+            ArgumentNullException.ThrowIfNull(asyncTransaction);
+            this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+            ArgumentNullException.ThrowIfNull(enlistmentState);
+            foreach (var rollbackAction in enlistmentState.RollbackActions)
+            {
+                rollbackAction();
+            }
+
+            this.enlistmentStates.TryRemove(asyncTransaction, out _);
             enlistment.Done();
         }
 
@@ -3953,6 +4373,8 @@ namespace UnitTest.Master
         /// <param name="orders">The order row.</param>
         public async Task<IEnumerable<Order>> UpdateAsync(IEnumerable<Order> orders)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var updatedRows = new List<Order>();
             foreach (var order in orders)
             {
@@ -3967,23 +4389,32 @@ namespace UnitTest.Master
                     ArgumentNullException.ThrowIfNull(removedAsset);
                     await removedAsset.EnterWriteLockAsync().ConfigureAwait(false);
                     var addedAccount = this.fixture.Accounts.Find(order.AccountId);
-                    ConstraintException.ThrowIfNull(addedAccount, "The action conflicted with the AccountOrderIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedAccount, "AccountOrderIndex");
                     await addedAccount.EnterWriteLockAsync().ConfigureAwait(false);
                     var addedAsset = this.fixture.Assets.Find(order.AssetId);
-                    ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetOrderIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedAsset, "AssetOrderIndex");
                     await addedAsset.EnterWriteLockAsync().ConfigureAwait(false);
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Order(foundRow);
+                    foundRow.Account = addedAccount;
+                    foundRow.AccountId = order.AccountId;
+                    foundRow.Asset = addedAsset;
+                    foundRow.AssetId = order.AssetId;
+                    foundRow.Quantity = order.Quantity;
+                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    removedAccount.Orders.Remove(foundRow);
+                    removedAsset.Orders.Remove(foundRow);
+                    addedAccount.Orders.Add(foundRow);
+                    addedAsset.Orders.Add(foundRow);
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        foundRow.Account = addedAccount;
-                        foundRow.AccountId = order.AccountId;
-                        foundRow.Asset = addedAsset;
-                        foundRow.AssetId = order.AssetId;
-                        foundRow.Quantity = order.Quantity;
-                        foundRow.RowVersion = this.fixture.IncrementRowVersion();
-                        removedAccount.Orders.Remove(order);
-                        removedAsset.Orders.Remove(order);
-                        addedAccount.Orders.Add(order);
-                        addedAsset.Orders.Add(order);
+                        foundRow.CopyFrom(originalRow);
+                        removedAccount.Orders.Add(foundRow);
+                        removedAsset.Orders.Add(foundRow);
+                        addedAccount.Orders.Remove(foundRow);
+                        addedAsset.Orders.Remove(foundRow);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Update, foundRow);
                     });
                     updatedRows.Add(foundRow);
@@ -4003,6 +4434,8 @@ namespace UnitTest.Master
         /// <param name="order">The order row.</param>
         public async Task<Order> UpdateAsync(Order order)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue((order.AccountId, order.AssetId), out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
@@ -4014,23 +4447,32 @@ namespace UnitTest.Master
                 ArgumentNullException.ThrowIfNull(removedAsset);
                 await removedAsset.EnterWriteLockAsync().ConfigureAwait(false);
                 var addedAccount = this.fixture.Accounts.Find(order.AccountId);
-                ConstraintException.ThrowIfNull(addedAccount, "The action conflicted with the AccountOrderIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAccount, "AccountOrderIndex");
                 await addedAccount.EnterWriteLockAsync().ConfigureAwait(false);
                 var addedAsset = this.fixture.Assets.Find(order.AssetId);
-                ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetOrderIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAsset, "AssetOrderIndex");
                 await addedAsset.EnterWriteLockAsync().ConfigureAwait(false);
-                this.CommitActions.Add(() =>
+                var originalRow = new Order(foundRow);
+                foundRow.Account = addedAccount;
+                foundRow.AccountId = order.AccountId;
+                foundRow.Asset = addedAsset;
+                foundRow.AssetId = order.AssetId;
+                foundRow.Quantity = order.Quantity;
+                foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                removedAccount.Orders.Remove(foundRow);
+                removedAsset.Orders.Remove(foundRow);
+                addedAccount.Orders.Add(foundRow);
+                addedAsset.Orders.Add(foundRow);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    foundRow.Account = addedAccount;
-                    foundRow.AccountId = order.AccountId;
-                    foundRow.Asset = addedAsset;
-                    foundRow.AssetId = order.AssetId;
-                    foundRow.Quantity = order.Quantity;
-                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
-                    removedAccount.Orders.Remove(order);
-                    removedAsset.Orders.Remove(order);
-                    addedAccount.Orders.Add(order);
-                    addedAsset.Orders.Add(order);
+                    foundRow.CopyFrom(originalRow);
+                    removedAccount.Orders.Add(foundRow);
+                    removedAsset.Orders.Add(foundRow);
+                    addedAccount.Orders.Remove(foundRow);
+                    addedAsset.Orders.Remove(foundRow);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Update, foundRow);
                 });
                 return foundRow;
@@ -4095,7 +4537,7 @@ namespace UnitTest.Master
                         await this.fixtureContext.SaveChangesAsync();
                     }
 
-                    asyncTransaction.Complete();
+                    asyncTransaction.Commit();
                 }
 
                 return this.Ok(order);
@@ -4142,7 +4584,7 @@ namespace UnitTest.Master
                 var deletedRows = await this.fixture.Orders.RemoveAsync(orders).ConfigureAwait(false);
                 this.fixtureContext.Orders.RemoveRange(deletedRows);
                 await this.fixtureContext.SaveChangesAsync();
-                asyncTransaction.Complete();
+                asyncTransaction.Commit();
                 return this.Ok(deletedRows);
             }
             catch (ConcurrencyException concurrencyException)
@@ -4286,7 +4728,7 @@ namespace UnitTest.Master
                 this.fixtureContext.Orders.AddRange(addedRows);
                 this.fixtureContext.Orders.UpdateRange(updatedRows);
                 await this.fixtureContext.SaveChangesAsync().ConfigureAwait(false);
-                asyncTransaction.Complete();
+                asyncTransaction.Commit();
                 return this.Ok(addedRows.Concat(updatedRows));
             }
             catch (ConcurrencyException concurrencyException)
@@ -4335,7 +4777,7 @@ namespace UnitTest.Master
                 {
                     this.fixtureContext.Add(addedRow);
                     await this.fixtureContext.SaveChangesAsync();
-                    asyncTransaction.Complete();
+                    asyncTransaction.Commit();
                     return this.Ok(addedRow);
                 }
 
@@ -4343,7 +4785,7 @@ namespace UnitTest.Master
                 {
                     this.fixtureContext.Update(updatedRow);
                     await this.fixtureContext.SaveChangesAsync();
-                    asyncTransaction.Complete();
+                    asyncTransaction.Commit();
                     return this.Ok(updatedRow);
                 }
 
@@ -4440,7 +4882,7 @@ namespace UnitTest.Master
         public long RowVersion { get; set; }
 
         /// <summary>
-        /// Shallow copy of a <see cref="Position"/> row.
+        /// Deep copy of a <see cref="Position"/> row.
         /// </summary>
         /// <param name="position">The destination <see cref="Position"/> row.</param>
         public void CopyFrom(Position position)
@@ -4517,14 +4959,14 @@ namespace UnitTest.Master
         private readonly AsyncReaderWriterLock asyncReaderWriterLock = new AsyncReaderWriterLock();
 
         /// <summary>
-        /// The commit actions for all the concurrent transactions.
-        /// </summary>
-        private ConcurrentDictionary<AsyncTransaction, List<Action>> commitDictionary = new ConcurrentDictionary<AsyncTransaction, List<Action>>();
-
-        /// <summary>
         /// The primary index.
         /// </summary>
         private readonly Dictionary<(System.Guid, System.Guid), Position> dictionary = new Dictionary<(System.Guid, System.Guid), Position>();
+
+        /// <summary>
+        /// The enlistment states for all the concurrent transactions.
+        /// </summary>
+        private readonly ConcurrentDictionary<AsyncTransaction, EnlistmentState> enlistmentStates = new ConcurrentDictionary<AsyncTransaction, EnlistmentState>();
 
         /// <summary>
         /// The data model.
@@ -4537,29 +4979,27 @@ namespace UnitTest.Master
         public event EventHandler<RowChangedEventArgs>? RowChanged;
 
         /// <summary>
-        /// Gets the commit actions for the current task.
+        /// Gets the list of deleted rows.
         /// </summary>
-        private List<Action> CommitActions
+        public LinkedList<Position> DeletedRows { get; } = new LinkedList<Position>();
+
+        /// <summary>
+        /// Gets the enlistment state for the current task.
+        /// </summary>
+        private EnlistmentState? EnlistmentState
         {
             get
             {
                 var asyncTransaction = AsyncTransaction.Current;
-                ArgumentNullException.ThrowIfNull(asyncTransaction);
-                if (asyncTransaction.CancellationToken.IsCancellationRequested)
+                if (asyncTransaction == null)
                 {
-                    throw new OperationCanceledException();
+                    return null;
                 }
 
-                this.commitDictionary.TryGetValue(asyncTransaction, out var commitActions);
-                ArgumentNullException.ThrowIfNull(commitActions);
-                return commitActions;
+                this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+                return enlistmentState;
             }
         }
-
-        /// <summary>
-        /// Gets the list of deleted rows.
-        /// </summary>
-        public LinkedList<Position> DeletedRows { get; } = new LinkedList<Position>();
 
         /// <summary>
         /// Adds a <see cref="Position"/> row.
@@ -4568,20 +5008,30 @@ namespace UnitTest.Master
         /// <returns>The added <see cref="Position"/> row.</returns>
         public async Task<Position> AddAsync(Position position)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var addedAccount = this.fixture.Accounts.Find(position.AccountId);
-            ConstraintException.ThrowIfNull(addedAccount, "The action conflicted with the AccountPositionIndex constraint.");
+            ConstraintException.ThrowIfNull(addedAccount, "AccountPositionIndex");
             await addedAccount.EnterWriteLockAsync().ConfigureAwait(false);
             var addedAsset = this.fixture.Assets.Find(position.AssetId);
-            ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetPositionIndex constraint.");
+            ConstraintException.ThrowIfNull(addedAsset, "AssetPositionIndex");
             await addedAsset.EnterWriteLockAsync().ConfigureAwait(false);
-            this.CommitActions.Add(() =>
+            var originalRow = new Position(position);
+            position.Account = addedAccount;
+            position.Asset = addedAsset;
+            position.RowVersion = this.fixture.IncrementRowVersion();
+            addedAccount.Positions.Add(position);
+            addedAsset.Positions.Add(position);
+            this.dictionary.Add((position.AccountId, position.AssetId), position);
+            enlistmentState.RollbackActions.Add(() =>
             {
-                position.Account = addedAccount;
-                position.Asset = addedAsset;
-                position.RowVersion = this.fixture.IncrementRowVersion();
-                addedAccount.Positions.Add(position);
-                addedAsset.Positions.Add(position);
-                this.dictionary.Add((position.AccountId, position.AssetId), position);
+                position.CopyFrom(originalRow);
+                addedAccount.Positions.Remove(position);
+                addedAsset.Positions.Remove(position);
+                this.dictionary.Remove((position.AccountId, position.AssetId));
+            });
+            enlistmentState.CommitActions.Add(() =>
+            {
                 this.OnRowChanged(DataAction.Add, position);
             });
             return position;
@@ -4594,23 +5044,33 @@ namespace UnitTest.Master
         /// <returns>The added <see cref="Position"/> rows.</returns>
         public async Task<IEnumerable<Position>> AddAsync(IEnumerable<Position> positions)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var addedRows = new List<Position>();
             foreach (var position in positions)
             {
                 var addedAccount = this.fixture.Accounts.Find(position.AccountId);
-                ConstraintException.ThrowIfNull(addedAccount, "The action conflicted with the AccountPositionIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAccount, "AccountPositionIndex");
                 await addedAccount.EnterWriteLockAsync().ConfigureAwait(false);
                 var addedAsset = this.fixture.Assets.Find(position.AssetId);
-                ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetPositionIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAsset, "AssetPositionIndex");
                 await addedAsset.EnterWriteLockAsync().ConfigureAwait(false);
-                this.CommitActions.Add(() =>
+                var originalRow = new Position(position);
+                position.Account = addedAccount;
+                position.Asset = addedAsset;
+                position.RowVersion = this.fixture.IncrementRowVersion();
+                addedAccount.Positions.Add(position);
+                addedAsset.Positions.Add(position);
+                this.dictionary.Add((position.AccountId, position.AssetId), position);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    position.Account = addedAccount;
-                    position.Asset = addedAsset;
-                    position.RowVersion = this.fixture.IncrementRowVersion();
-                    addedAccount.Positions.Add(position);
-                    addedAsset.Positions.Add(position);
-                    this.dictionary.Add((position.AccountId, position.AssetId), position);
+                    position.CopyFrom(originalRow);
+                    addedAccount.Positions.Remove(position);
+                    addedAsset.Positions.Remove(position);
+                    this.dictionary.Remove((position.AccountId, position.AssetId));
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Add, position);
                 });
                 addedRows.Add(position);
@@ -4624,14 +5084,14 @@ namespace UnitTest.Master
         {
             var asyncTransaction = AsyncTransaction.Current;
             ArgumentNullException.ThrowIfNull(asyncTransaction);
-            this.commitDictionary.TryGetValue(asyncTransaction, out var commitActions);
-            ArgumentNullException.ThrowIfNull(commitActions);
-            foreach (var commitAction in commitActions)
+            this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+            ArgumentNullException.ThrowIfNull(enlistmentState);
+            foreach (var commitAction in enlistmentState.CommitActions)
             {
                 commitAction();
             }
 
-            this.commitDictionary.TryRemove(asyncTransaction, out _);
+            this.enlistmentStates.TryRemove(asyncTransaction, out _);
             enlistment.Done();
         }
 
@@ -4648,7 +5108,7 @@ namespace UnitTest.Master
                 await this.asyncReaderWriterLock.EnterReadLockAsync(asyncTransaction.CancellationToken).ConfigureAwait(false);
                 asyncTransaction.ReadLocks.Add(this, this.asyncReaderWriterLock);
                 asyncTransaction.EnlistVolatile(this);
-                this.commitDictionary.TryAdd(asyncTransaction, new List<Action>());
+                this.enlistmentStates.TryAdd(asyncTransaction, new EnlistmentState());
             }
         }
 
@@ -4673,7 +5133,7 @@ namespace UnitTest.Master
                     await this.asyncReaderWriterLock.EnterWriteLockAsync(asyncTransaction.CancellationToken).ConfigureAwait(false);
                     asyncTransaction.WriteLocks.Add(this, this.asyncReaderWriterLock);
                     asyncTransaction.EnlistVolatile(this);
-                    this.commitDictionary.TryAdd(asyncTransaction, new List<Action>());
+                    this.enlistmentStates.TryAdd(asyncTransaction, new EnlistmentState());
                 }
             }
         }
@@ -4718,7 +5178,7 @@ namespace UnitTest.Master
                 var account = this.fixture.Accounts.Find(position.AccountId);
                 if (account == null)
                 {
-                    throw new ConstraintException("The insert action conflicted with the constraint AccountPositionIndex");
+                    throw new ConstraintException("AccountPositionIndex");
                 }
 
                 account.Positions.Add(position);
@@ -4726,7 +5186,7 @@ namespace UnitTest.Master
                 var asset = this.fixture.Assets.Find(position.AssetId);
                 if (asset == null)
                 {
-                    throw new ConstraintException("The insert action conflicted with the constraint AssetPositionIndex");
+                    throw new ConstraintException("AssetPositionIndex");
                 }
 
                 asset.Positions.Add(position);
@@ -4763,6 +5223,8 @@ namespace UnitTest.Master
         /// <returns>The patched <see cref="Position"/> rows.</returns>
         public async Task<(IEnumerable<Position> AddedRows, IEnumerable<Position> UpdatedRows)> PatchAsync(IEnumerable<Position> positions)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var addedRows = new List<Position>();
             var updatedRows = new List<Position>();
             foreach (var position in positions)
@@ -4778,23 +5240,32 @@ namespace UnitTest.Master
                     ArgumentNullException.ThrowIfNull(removedAsset);
                     await removedAsset.EnterWriteLockAsync().ConfigureAwait(false);
                     var addedAccount = this.fixture.Accounts.Find(position.AccountId);
-                    ConstraintException.ThrowIfNull(addedAccount, "The action conflicted with the AccountPositionIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedAccount, "AccountPositionIndex");
                     await addedAccount.EnterWriteLockAsync().ConfigureAwait(false);
                     var addedAsset = this.fixture.Assets.Find(position.AssetId);
-                    ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetPositionIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedAsset, "AssetPositionIndex");
                     await addedAsset.EnterWriteLockAsync().ConfigureAwait(false);
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Position(foundRow);
+                    foundRow.Account = addedAccount;
+                    foundRow.AccountId = position.AccountId;
+                    foundRow.Asset = addedAsset;
+                    foundRow.AssetId = position.AssetId;
+                    foundRow.Quantity = position.Quantity;
+                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    removedAccount.Positions.Remove(foundRow);
+                    removedAsset.Positions.Remove(foundRow);
+                    addedAccount.Positions.Add(foundRow);
+                    addedAsset.Positions.Add(foundRow);
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        foundRow.Account = addedAccount;
-                        foundRow.AccountId = position.AccountId;
-                        foundRow.Asset = addedAsset;
-                        foundRow.AssetId = position.AssetId;
-                        foundRow.Quantity = position.Quantity;
-                        foundRow.RowVersion = this.fixture.IncrementRowVersion();
-                        removedAccount.Positions.Remove(position);
-                        removedAsset.Positions.Remove(position);
-                        addedAccount.Positions.Add(position);
-                        addedAsset.Positions.Add(position);
+                        foundRow.CopyFrom(originalRow);
+                        removedAccount.Positions.Add(foundRow);
+                        removedAsset.Positions.Add(foundRow);
+                        addedAccount.Positions.Remove(foundRow);
+                        addedAsset.Positions.Remove(foundRow);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Update, foundRow);
                     });
                     updatedRows.Add(foundRow);
@@ -4802,19 +5273,27 @@ namespace UnitTest.Master
                 else
                 {
                     var addedAccount = this.fixture.Accounts.Find(position.AccountId);
-                    ConstraintException.ThrowIfNull(addedAccount, "The action conflicted with the AccountPositionIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedAccount, "AccountPositionIndex");
                     await addedAccount.EnterWriteLockAsync().ConfigureAwait(false);
                     var addedAsset = this.fixture.Assets.Find(position.AssetId);
-                    ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetPositionIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedAsset, "AssetPositionIndex");
                     await addedAsset.EnterWriteLockAsync().ConfigureAwait(false);
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Position(position);
+                    position.Account = addedAccount;
+                    position.Asset = addedAsset;
+                    position.RowVersion = this.fixture.IncrementRowVersion();
+                    addedAccount.Positions.Add(position);
+                    addedAsset.Positions.Add(position);
+                    this.dictionary.Add((position.AccountId, position.AssetId), position);
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        position.Account = addedAccount;
-                        position.Asset = addedAsset;
-                        position.RowVersion = this.fixture.IncrementRowVersion();
-                        addedAccount.Positions.Add(position);
-                        addedAsset.Positions.Add(position);
-                        this.dictionary.Add((position.AccountId, position.AssetId), position);
+                        position.CopyFrom(originalRow);
+                        addedAccount.Positions.Remove(position);
+                        addedAsset.Positions.Remove(position);
+                        this.dictionary.Remove((position.AccountId, position.AssetId));
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Add, position);
                     });
                     addedRows.Add(position);
@@ -4837,6 +5316,8 @@ namespace UnitTest.Master
         /// <returns>The added or updated <see cref="Position"/> row.</returns>
         public async Task<(Position? AddedRow, Position? UpdatedRow)> PutAsync(Position position)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue((position.AccountId, position.AssetId), out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
@@ -4848,23 +5329,32 @@ namespace UnitTest.Master
                 ArgumentNullException.ThrowIfNull(removedAsset);
                 await removedAsset.EnterWriteLockAsync().ConfigureAwait(false);
                 var addedAccount = this.fixture.Accounts.Find(position.AccountId);
-                ConstraintException.ThrowIfNull(addedAccount, "The action conflicted with the AccountPositionIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAccount, "AccountPositionIndex");
                 await addedAccount.EnterWriteLockAsync().ConfigureAwait(false);
                 var addedAsset = this.fixture.Assets.Find(position.AssetId);
-                ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetPositionIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAsset, "AssetPositionIndex");
                 await addedAsset.EnterWriteLockAsync().ConfigureAwait(false);
-                this.CommitActions.Add(() =>
+                var originalRow = new Position(foundRow);
+                foundRow.Account = addedAccount;
+                foundRow.AccountId = position.AccountId;
+                foundRow.Asset = addedAsset;
+                foundRow.AssetId = position.AssetId;
+                foundRow.Quantity = position.Quantity;
+                foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                removedAccount.Positions.Remove(foundRow);
+                removedAsset.Positions.Remove(foundRow);
+                addedAccount.Positions.Add(foundRow);
+                addedAsset.Positions.Add(foundRow);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    foundRow.Account = addedAccount;
-                    foundRow.AccountId = position.AccountId;
-                    foundRow.Asset = addedAsset;
-                    foundRow.AssetId = position.AssetId;
-                    foundRow.Quantity = position.Quantity;
-                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
-                    removedAccount.Positions.Remove(position);
-                    removedAsset.Positions.Remove(position);
-                    addedAccount.Positions.Add(position);
-                    addedAsset.Positions.Add(position);
+                    foundRow.CopyFrom(originalRow);
+                    removedAccount.Positions.Add(foundRow);
+                    removedAsset.Positions.Add(foundRow);
+                    addedAccount.Positions.Remove(foundRow);
+                    addedAsset.Positions.Remove(foundRow);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Update, foundRow);
                 });
                 return (AddedRow: null, UpdatedRow: foundRow);
@@ -4872,19 +5362,27 @@ namespace UnitTest.Master
             else
             {
                 var addedAccount = this.fixture.Accounts.Find(position.AccountId);
-                ConstraintException.ThrowIfNull(addedAccount, "The action conflicted with the AccountPositionIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAccount, "AccountPositionIndex");
                 await addedAccount.EnterWriteLockAsync().ConfigureAwait(false);
                 var addedAsset = this.fixture.Assets.Find(position.AssetId);
-                ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetPositionIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAsset, "AssetPositionIndex");
                 await addedAsset.EnterWriteLockAsync().ConfigureAwait(false);
-                this.CommitActions.Add(() =>
+                var originalRow = new Position(position);
+                position.Account = addedAccount;
+                position.Asset = addedAsset;
+                position.RowVersion = this.fixture.IncrementRowVersion();
+                addedAccount.Positions.Add(position);
+                addedAsset.Positions.Add(position);
+                this.dictionary.Add((position.AccountId, position.AssetId), position);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    position.Account = addedAccount;
-                    position.Asset = addedAsset;
-                    position.RowVersion = this.fixture.IncrementRowVersion();
-                    addedAccount.Positions.Add(position);
-                    addedAsset.Positions.Add(position);
-                    this.dictionary.Add((position.AccountId, position.AssetId), position);
+                    position.CopyFrom(originalRow);
+                    addedAccount.Positions.Remove(position);
+                    addedAsset.Positions.Remove(position);
+                    this.dictionary.Remove((position.AccountId, position.AssetId));
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Add, position);
                 });
                 return (AddedRow: position, UpdatedRow: null);
@@ -4898,6 +5396,8 @@ namespace UnitTest.Master
         /// <returns>The removed <see cref="Position"/> rows.</returns>
         public async Task<IEnumerable<Position>> RemoveAsync(IEnumerable<Position> positions)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var removedRows = new List<Position>();
             foreach (var position in positions)
             {
@@ -4911,14 +5411,22 @@ namespace UnitTest.Master
                     var removedAsset = this.fixture.Assets.Find(position.AssetId);
                     ArgumentNullException.ThrowIfNull(removedAsset);
                     await removedAsset.EnterWriteLockAsync().ConfigureAwait(false);
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Position(foundRow);
+                    foundRow.Account = null;
+                    foundRow.Asset = null;
+                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    removedAccount.Positions.Remove(foundRow);
+                    removedAsset.Positions.Remove(foundRow);
+                    this.dictionary.Remove((foundRow.AccountId, foundRow.AssetId));
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        foundRow.Account = null;
-                        foundRow.Asset = null;
-                        foundRow.RowVersion = this.fixture.IncrementRowVersion();
-                        removedAccount.Positions.Remove(position);
-                        removedAsset.Positions.Remove(position);
-                        this.dictionary.Remove((foundRow.AccountId, foundRow.AssetId));
+                        foundRow.CopyFrom(originalRow);
+                        removedAccount.Positions.Add(foundRow);
+                        removedAsset.Positions.Add(foundRow);
+                        this.dictionary.Add((foundRow.AccountId, foundRow.AssetId), foundRow);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.DeletedRows.AddFirst(foundRow);
                         this.OnRowChanged(DataAction.Remove, foundRow);
                     });
@@ -4936,6 +5444,8 @@ namespace UnitTest.Master
         /// <returns>The removed <see cref="Position"/> row.</returns>
         public async Task<Position?> RemoveAsync(Position position)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue((position.AccountId, position.AssetId), out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
@@ -4946,14 +5456,22 @@ namespace UnitTest.Master
                 var removedAsset = this.fixture.Assets.Find(position.AssetId);
                 ArgumentNullException.ThrowIfNull(removedAsset);
                 await removedAsset.EnterWriteLockAsync().ConfigureAwait(false);
-                this.CommitActions.Add(() =>
+                var originalRow = new Position(foundRow);
+                foundRow.Account = null;
+                foundRow.Asset = null;
+                foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                removedAccount.Positions.Remove(foundRow);
+                removedAsset.Positions.Remove(foundRow);
+                this.dictionary.Remove((foundRow.AccountId, foundRow.AssetId));
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    foundRow.Account = null;
-                    foundRow.Asset = null;
-                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
-                    removedAccount.Positions.Remove(position);
-                    removedAsset.Positions.Remove(position);
-                    this.dictionary.Remove((foundRow.AccountId, foundRow.AssetId));
+                    foundRow.CopyFrom(originalRow);
+                    removedAccount.Positions.Add(foundRow);
+                    removedAsset.Positions.Add(foundRow);
+                    this.dictionary.Add((foundRow.AccountId, foundRow.AssetId), foundRow);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.DeletedRows.AddFirst(foundRow);
                     this.OnRowChanged(DataAction.Remove, foundRow);
                 });
@@ -4968,6 +5486,16 @@ namespace UnitTest.Master
         /// <inheritdoc/>
         public void Rollback(Enlistment enlistment)
         {
+            var asyncTransaction = AsyncTransaction.Current;
+            ArgumentNullException.ThrowIfNull(asyncTransaction);
+            this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+            ArgumentNullException.ThrowIfNull(enlistmentState);
+            foreach (var rollbackAction in enlistmentState.RollbackActions)
+            {
+                rollbackAction();
+            }
+
+            this.enlistmentStates.TryRemove(asyncTransaction, out _);
             enlistment.Done();
         }
 
@@ -4977,6 +5505,8 @@ namespace UnitTest.Master
         /// <param name="positions">The position row.</param>
         public async Task<IEnumerable<Position>> UpdateAsync(IEnumerable<Position> positions)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var updatedRows = new List<Position>();
             foreach (var position in positions)
             {
@@ -4991,23 +5521,32 @@ namespace UnitTest.Master
                     ArgumentNullException.ThrowIfNull(removedAsset);
                     await removedAsset.EnterWriteLockAsync().ConfigureAwait(false);
                     var addedAccount = this.fixture.Accounts.Find(position.AccountId);
-                    ConstraintException.ThrowIfNull(addedAccount, "The action conflicted with the AccountPositionIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedAccount, "AccountPositionIndex");
                     await addedAccount.EnterWriteLockAsync().ConfigureAwait(false);
                     var addedAsset = this.fixture.Assets.Find(position.AssetId);
-                    ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetPositionIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedAsset, "AssetPositionIndex");
                     await addedAsset.EnterWriteLockAsync().ConfigureAwait(false);
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Position(foundRow);
+                    foundRow.Account = addedAccount;
+                    foundRow.AccountId = position.AccountId;
+                    foundRow.Asset = addedAsset;
+                    foundRow.AssetId = position.AssetId;
+                    foundRow.Quantity = position.Quantity;
+                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    removedAccount.Positions.Remove(foundRow);
+                    removedAsset.Positions.Remove(foundRow);
+                    addedAccount.Positions.Add(foundRow);
+                    addedAsset.Positions.Add(foundRow);
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        foundRow.Account = addedAccount;
-                        foundRow.AccountId = position.AccountId;
-                        foundRow.Asset = addedAsset;
-                        foundRow.AssetId = position.AssetId;
-                        foundRow.Quantity = position.Quantity;
-                        foundRow.RowVersion = this.fixture.IncrementRowVersion();
-                        removedAccount.Positions.Remove(position);
-                        removedAsset.Positions.Remove(position);
-                        addedAccount.Positions.Add(position);
-                        addedAsset.Positions.Add(position);
+                        foundRow.CopyFrom(originalRow);
+                        removedAccount.Positions.Add(foundRow);
+                        removedAsset.Positions.Add(foundRow);
+                        addedAccount.Positions.Remove(foundRow);
+                        addedAsset.Positions.Remove(foundRow);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Update, foundRow);
                     });
                     updatedRows.Add(foundRow);
@@ -5027,6 +5566,8 @@ namespace UnitTest.Master
         /// <param name="position">The position row.</param>
         public async Task<Position> UpdateAsync(Position position)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue((position.AccountId, position.AssetId), out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
@@ -5038,23 +5579,32 @@ namespace UnitTest.Master
                 ArgumentNullException.ThrowIfNull(removedAsset);
                 await removedAsset.EnterWriteLockAsync().ConfigureAwait(false);
                 var addedAccount = this.fixture.Accounts.Find(position.AccountId);
-                ConstraintException.ThrowIfNull(addedAccount, "The action conflicted with the AccountPositionIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAccount, "AccountPositionIndex");
                 await addedAccount.EnterWriteLockAsync().ConfigureAwait(false);
                 var addedAsset = this.fixture.Assets.Find(position.AssetId);
-                ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetPositionIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAsset, "AssetPositionIndex");
                 await addedAsset.EnterWriteLockAsync().ConfigureAwait(false);
-                this.CommitActions.Add(() =>
+                var originalRow = new Position(foundRow);
+                foundRow.Account = addedAccount;
+                foundRow.AccountId = position.AccountId;
+                foundRow.Asset = addedAsset;
+                foundRow.AssetId = position.AssetId;
+                foundRow.Quantity = position.Quantity;
+                foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                removedAccount.Positions.Remove(foundRow);
+                removedAsset.Positions.Remove(foundRow);
+                addedAccount.Positions.Add(foundRow);
+                addedAsset.Positions.Add(foundRow);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    foundRow.Account = addedAccount;
-                    foundRow.AccountId = position.AccountId;
-                    foundRow.Asset = addedAsset;
-                    foundRow.AssetId = position.AssetId;
-                    foundRow.Quantity = position.Quantity;
-                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
-                    removedAccount.Positions.Remove(position);
-                    removedAsset.Positions.Remove(position);
-                    addedAccount.Positions.Add(position);
-                    addedAsset.Positions.Add(position);
+                    foundRow.CopyFrom(originalRow);
+                    removedAccount.Positions.Add(foundRow);
+                    removedAsset.Positions.Add(foundRow);
+                    addedAccount.Positions.Remove(foundRow);
+                    addedAsset.Positions.Remove(foundRow);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Update, foundRow);
                 });
                 return foundRow;
@@ -5119,7 +5669,7 @@ namespace UnitTest.Master
                         await this.fixtureContext.SaveChangesAsync();
                     }
 
-                    asyncTransaction.Complete();
+                    asyncTransaction.Commit();
                 }
 
                 return this.Ok(position);
@@ -5166,7 +5716,7 @@ namespace UnitTest.Master
                 var deletedRows = await this.fixture.Positions.RemoveAsync(positions).ConfigureAwait(false);
                 this.fixtureContext.Positions.RemoveRange(deletedRows);
                 await this.fixtureContext.SaveChangesAsync();
-                asyncTransaction.Complete();
+                asyncTransaction.Commit();
                 return this.Ok(deletedRows);
             }
             catch (ConcurrencyException concurrencyException)
@@ -5310,7 +5860,7 @@ namespace UnitTest.Master
                 this.fixtureContext.Positions.AddRange(addedRows);
                 this.fixtureContext.Positions.UpdateRange(updatedRows);
                 await this.fixtureContext.SaveChangesAsync().ConfigureAwait(false);
-                asyncTransaction.Complete();
+                asyncTransaction.Commit();
                 return this.Ok(addedRows.Concat(updatedRows));
             }
             catch (ConcurrencyException concurrencyException)
@@ -5359,7 +5909,7 @@ namespace UnitTest.Master
                 {
                     this.fixtureContext.Add(addedRow);
                     await this.fixtureContext.SaveChangesAsync();
-                    asyncTransaction.Complete();
+                    asyncTransaction.Commit();
                     return this.Ok(addedRow);
                 }
 
@@ -5367,7 +5917,7 @@ namespace UnitTest.Master
                 {
                     this.fixtureContext.Update(updatedRow);
                     await this.fixtureContext.SaveChangesAsync();
-                    asyncTransaction.Complete();
+                    asyncTransaction.Commit();
                     return this.Ok(updatedRow);
                 }
 
@@ -5450,7 +6000,7 @@ namespace UnitTest.Master
         public long RowVersion { get; set; }
 
         /// <summary>
-        /// Shallow copy of a <see cref="Quote"/> row.
+        /// Deep copy of a <see cref="Quote"/> row.
         /// </summary>
         /// <param name="quote">The destination <see cref="Quote"/> row.</param>
         public void CopyFrom(Quote quote)
@@ -5525,14 +6075,14 @@ namespace UnitTest.Master
         private readonly AsyncReaderWriterLock asyncReaderWriterLock = new AsyncReaderWriterLock();
 
         /// <summary>
-        /// The commit actions for all the concurrent transactions.
-        /// </summary>
-        private ConcurrentDictionary<AsyncTransaction, List<Action>> commitDictionary = new ConcurrentDictionary<AsyncTransaction, List<Action>>();
-
-        /// <summary>
         /// The primary index.
         /// </summary>
         private readonly Dictionary<System.Guid, Quote> dictionary = new Dictionary<System.Guid, Quote>();
+
+        /// <summary>
+        /// The enlistment states for all the concurrent transactions.
+        /// </summary>
+        private readonly ConcurrentDictionary<AsyncTransaction, EnlistmentState> enlistmentStates = new ConcurrentDictionary<AsyncTransaction, EnlistmentState>();
 
         /// <summary>
         /// The data model.
@@ -5545,29 +6095,27 @@ namespace UnitTest.Master
         public event EventHandler<RowChangedEventArgs>? RowChanged;
 
         /// <summary>
-        /// Gets the commit actions for the current task.
+        /// Gets the list of deleted rows.
         /// </summary>
-        private List<Action> CommitActions
+        public LinkedList<Quote> DeletedRows { get; } = new LinkedList<Quote>();
+
+        /// <summary>
+        /// Gets the enlistment state for the current task.
+        /// </summary>
+        private EnlistmentState? EnlistmentState
         {
             get
             {
                 var asyncTransaction = AsyncTransaction.Current;
-                ArgumentNullException.ThrowIfNull(asyncTransaction);
-                if (asyncTransaction.CancellationToken.IsCancellationRequested)
+                if (asyncTransaction == null)
                 {
-                    throw new OperationCanceledException();
+                    return null;
                 }
 
-                this.commitDictionary.TryGetValue(asyncTransaction, out var commitActions);
-                ArgumentNullException.ThrowIfNull(commitActions);
-                return commitActions;
+                this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+                return enlistmentState;
             }
         }
-
-        /// <summary>
-        /// Gets the list of deleted rows.
-        /// </summary>
-        public LinkedList<Quote> DeletedRows { get; } = new LinkedList<Quote>();
 
         /// <summary>
         /// Adds a <see cref="Quote"/> row.
@@ -5576,15 +6124,24 @@ namespace UnitTest.Master
         /// <returns>The added <see cref="Quote"/> row.</returns>
         public async Task<Quote> AddAsync(Quote quote)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var addedAsset = this.fixture.Assets.Find(quote.AssetId);
-            ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetQuoteIndex constraint.");
+            ConstraintException.ThrowIfNull(addedAsset, "AssetQuoteIndex");
             await addedAsset.EnterWriteLockAsync().ConfigureAwait(false);
-            this.CommitActions.Add(() =>
+            var originalRow = new Quote(quote);
+            quote.Asset = addedAsset;
+            quote.RowVersion = this.fixture.IncrementRowVersion();
+            addedAsset.Quotes.Add(quote);
+            this.dictionary.Add(quote.AssetId, quote);
+            enlistmentState.RollbackActions.Add(() =>
             {
-                quote.Asset = addedAsset;
-                quote.RowVersion = this.fixture.IncrementRowVersion();
-                addedAsset.Quotes.Add(quote);
-                this.dictionary.Add(quote.AssetId, quote);
+                quote.CopyFrom(originalRow);
+                addedAsset.Quotes.Remove(quote);
+                this.dictionary.Remove(quote.AssetId);
+            });
+            enlistmentState.CommitActions.Add(() =>
+            {
                 this.OnRowChanged(DataAction.Add, quote);
             });
             return quote;
@@ -5597,18 +6154,27 @@ namespace UnitTest.Master
         /// <returns>The added <see cref="Quote"/> rows.</returns>
         public async Task<IEnumerable<Quote>> AddAsync(IEnumerable<Quote> quotes)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var addedRows = new List<Quote>();
             foreach (var quote in quotes)
             {
                 var addedAsset = this.fixture.Assets.Find(quote.AssetId);
-                ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetQuoteIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAsset, "AssetQuoteIndex");
                 await addedAsset.EnterWriteLockAsync().ConfigureAwait(false);
-                this.CommitActions.Add(() =>
+                var originalRow = new Quote(quote);
+                quote.Asset = addedAsset;
+                quote.RowVersion = this.fixture.IncrementRowVersion();
+                addedAsset.Quotes.Add(quote);
+                this.dictionary.Add(quote.AssetId, quote);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    quote.Asset = addedAsset;
-                    quote.RowVersion = this.fixture.IncrementRowVersion();
-                    addedAsset.Quotes.Add(quote);
-                    this.dictionary.Add(quote.AssetId, quote);
+                    quote.CopyFrom(originalRow);
+                    addedAsset.Quotes.Remove(quote);
+                    this.dictionary.Remove(quote.AssetId);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Add, quote);
                 });
                 addedRows.Add(quote);
@@ -5622,14 +6188,14 @@ namespace UnitTest.Master
         {
             var asyncTransaction = AsyncTransaction.Current;
             ArgumentNullException.ThrowIfNull(asyncTransaction);
-            this.commitDictionary.TryGetValue(asyncTransaction, out var commitActions);
-            ArgumentNullException.ThrowIfNull(commitActions);
-            foreach (var commitAction in commitActions)
+            this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+            ArgumentNullException.ThrowIfNull(enlistmentState);
+            foreach (var commitAction in enlistmentState.CommitActions)
             {
                 commitAction();
             }
 
-            this.commitDictionary.TryRemove(asyncTransaction, out _);
+            this.enlistmentStates.TryRemove(asyncTransaction, out _);
             enlistment.Done();
         }
 
@@ -5646,7 +6212,7 @@ namespace UnitTest.Master
                 await this.asyncReaderWriterLock.EnterReadLockAsync(asyncTransaction.CancellationToken).ConfigureAwait(false);
                 asyncTransaction.ReadLocks.Add(this, this.asyncReaderWriterLock);
                 asyncTransaction.EnlistVolatile(this);
-                this.commitDictionary.TryAdd(asyncTransaction, new List<Action>());
+                this.enlistmentStates.TryAdd(asyncTransaction, new EnlistmentState());
             }
         }
 
@@ -5671,7 +6237,7 @@ namespace UnitTest.Master
                     await this.asyncReaderWriterLock.EnterWriteLockAsync(asyncTransaction.CancellationToken).ConfigureAwait(false);
                     asyncTransaction.WriteLocks.Add(this, this.asyncReaderWriterLock);
                     asyncTransaction.EnlistVolatile(this);
-                    this.commitDictionary.TryAdd(asyncTransaction, new List<Action>());
+                    this.enlistmentStates.TryAdd(asyncTransaction, new EnlistmentState());
                 }
             }
         }
@@ -5715,7 +6281,7 @@ namespace UnitTest.Master
                 var asset = this.fixture.Assets.Find(quote.AssetId);
                 if (asset == null)
                 {
-                    throw new ConstraintException("The insert action conflicted with the constraint AssetQuoteIndex");
+                    throw new ConstraintException("AssetQuoteIndex");
                 }
 
                 asset.Quotes.Add(quote);
@@ -5752,6 +6318,8 @@ namespace UnitTest.Master
         /// <returns>The patched <see cref="Quote"/> rows.</returns>
         public async Task<(IEnumerable<Quote> AddedRows, IEnumerable<Quote> UpdatedRows)> PatchAsync(IEnumerable<Quote> quotes)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var addedRows = new List<Quote>();
             var updatedRows = new List<Quote>();
             foreach (var quote in quotes)
@@ -5764,16 +6332,23 @@ namespace UnitTest.Master
                     ArgumentNullException.ThrowIfNull(removedAsset);
                     await removedAsset.EnterWriteLockAsync().ConfigureAwait(false);
                     var addedAsset = this.fixture.Assets.Find(quote.AssetId);
-                    ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetQuoteIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedAsset, "AssetQuoteIndex");
                     await addedAsset.EnterWriteLockAsync().ConfigureAwait(false);
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Quote(foundRow);
+                    foundRow.Asset = addedAsset;
+                    foundRow.AssetId = quote.AssetId;
+                    foundRow.Last = quote.Last;
+                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    removedAsset.Quotes.Remove(foundRow);
+                    addedAsset.Quotes.Add(foundRow);
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        foundRow.Asset = addedAsset;
-                        foundRow.AssetId = quote.AssetId;
-                        foundRow.Last = quote.Last;
-                        foundRow.RowVersion = this.fixture.IncrementRowVersion();
-                        removedAsset.Quotes.Remove(quote);
-                        addedAsset.Quotes.Add(quote);
+                        foundRow.CopyFrom(originalRow);
+                        removedAsset.Quotes.Add(foundRow);
+                        addedAsset.Quotes.Remove(foundRow);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Update, foundRow);
                     });
                     updatedRows.Add(foundRow);
@@ -5781,14 +6356,21 @@ namespace UnitTest.Master
                 else
                 {
                     var addedAsset = this.fixture.Assets.Find(quote.AssetId);
-                    ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetQuoteIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedAsset, "AssetQuoteIndex");
                     await addedAsset.EnterWriteLockAsync().ConfigureAwait(false);
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Quote(quote);
+                    quote.Asset = addedAsset;
+                    quote.RowVersion = this.fixture.IncrementRowVersion();
+                    addedAsset.Quotes.Add(quote);
+                    this.dictionary.Add(quote.AssetId, quote);
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        quote.Asset = addedAsset;
-                        quote.RowVersion = this.fixture.IncrementRowVersion();
-                        addedAsset.Quotes.Add(quote);
-                        this.dictionary.Add(quote.AssetId, quote);
+                        quote.CopyFrom(originalRow);
+                        addedAsset.Quotes.Remove(quote);
+                        this.dictionary.Remove(quote.AssetId);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Add, quote);
                     });
                     addedRows.Add(quote);
@@ -5811,6 +6393,8 @@ namespace UnitTest.Master
         /// <returns>The added or updated <see cref="Quote"/> row.</returns>
         public async Task<(Quote? AddedRow, Quote? UpdatedRow)> PutAsync(Quote quote)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue(quote.AssetId, out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
@@ -5819,16 +6403,23 @@ namespace UnitTest.Master
                 ArgumentNullException.ThrowIfNull(removedAsset);
                 await removedAsset.EnterWriteLockAsync().ConfigureAwait(false);
                 var addedAsset = this.fixture.Assets.Find(quote.AssetId);
-                ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetQuoteIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAsset, "AssetQuoteIndex");
                 await addedAsset.EnterWriteLockAsync().ConfigureAwait(false);
-                this.CommitActions.Add(() =>
+                var originalRow = new Quote(foundRow);
+                foundRow.Asset = addedAsset;
+                foundRow.AssetId = quote.AssetId;
+                foundRow.Last = quote.Last;
+                foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                removedAsset.Quotes.Remove(foundRow);
+                addedAsset.Quotes.Add(foundRow);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    foundRow.Asset = addedAsset;
-                    foundRow.AssetId = quote.AssetId;
-                    foundRow.Last = quote.Last;
-                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
-                    removedAsset.Quotes.Remove(quote);
-                    addedAsset.Quotes.Add(quote);
+                    foundRow.CopyFrom(originalRow);
+                    removedAsset.Quotes.Add(foundRow);
+                    addedAsset.Quotes.Remove(foundRow);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Update, foundRow);
                 });
                 return (AddedRow: null, UpdatedRow: foundRow);
@@ -5836,14 +6427,21 @@ namespace UnitTest.Master
             else
             {
                 var addedAsset = this.fixture.Assets.Find(quote.AssetId);
-                ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetQuoteIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAsset, "AssetQuoteIndex");
                 await addedAsset.EnterWriteLockAsync().ConfigureAwait(false);
-                this.CommitActions.Add(() =>
+                var originalRow = new Quote(quote);
+                quote.Asset = addedAsset;
+                quote.RowVersion = this.fixture.IncrementRowVersion();
+                addedAsset.Quotes.Add(quote);
+                this.dictionary.Add(quote.AssetId, quote);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    quote.Asset = addedAsset;
-                    quote.RowVersion = this.fixture.IncrementRowVersion();
-                    addedAsset.Quotes.Add(quote);
-                    this.dictionary.Add(quote.AssetId, quote);
+                    quote.CopyFrom(originalRow);
+                    addedAsset.Quotes.Remove(quote);
+                    this.dictionary.Remove(quote.AssetId);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Add, quote);
                 });
                 return (AddedRow: quote, UpdatedRow: null);
@@ -5857,6 +6455,8 @@ namespace UnitTest.Master
         /// <returns>The removed <see cref="Quote"/> rows.</returns>
         public async Task<IEnumerable<Quote>> RemoveAsync(IEnumerable<Quote> quotes)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var removedRows = new List<Quote>();
             foreach (var quote in quotes)
             {
@@ -5867,12 +6467,19 @@ namespace UnitTest.Master
                     var removedAsset = this.fixture.Assets.Find(quote.AssetId);
                     ArgumentNullException.ThrowIfNull(removedAsset);
                     await removedAsset.EnterWriteLockAsync().ConfigureAwait(false);
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Quote(foundRow);
+                    foundRow.Asset = null;
+                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    removedAsset.Quotes.Remove(foundRow);
+                    this.dictionary.Remove(foundRow.AssetId);
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        foundRow.Asset = null;
-                        foundRow.RowVersion = this.fixture.IncrementRowVersion();
-                        removedAsset.Quotes.Remove(quote);
-                        this.dictionary.Remove(foundRow.AssetId);
+                        foundRow.CopyFrom(originalRow);
+                        removedAsset.Quotes.Add(foundRow);
+                        this.dictionary.Add(foundRow.AssetId, foundRow);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.DeletedRows.AddFirst(foundRow);
                         this.OnRowChanged(DataAction.Remove, foundRow);
                     });
@@ -5890,6 +6497,8 @@ namespace UnitTest.Master
         /// <returns>The removed <see cref="Quote"/> row.</returns>
         public async Task<Quote?> RemoveAsync(Quote quote)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue(quote.AssetId, out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
@@ -5897,12 +6506,19 @@ namespace UnitTest.Master
                 var removedAsset = this.fixture.Assets.Find(quote.AssetId);
                 ArgumentNullException.ThrowIfNull(removedAsset);
                 await removedAsset.EnterWriteLockAsync().ConfigureAwait(false);
-                this.CommitActions.Add(() =>
+                var originalRow = new Quote(foundRow);
+                foundRow.Asset = null;
+                foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                removedAsset.Quotes.Remove(foundRow);
+                this.dictionary.Remove(foundRow.AssetId);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    foundRow.Asset = null;
-                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
-                    removedAsset.Quotes.Remove(quote);
-                    this.dictionary.Remove(foundRow.AssetId);
+                    foundRow.CopyFrom(originalRow);
+                    removedAsset.Quotes.Add(foundRow);
+                    this.dictionary.Add(foundRow.AssetId, foundRow);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.DeletedRows.AddFirst(foundRow);
                     this.OnRowChanged(DataAction.Remove, foundRow);
                 });
@@ -5917,6 +6533,16 @@ namespace UnitTest.Master
         /// <inheritdoc/>
         public void Rollback(Enlistment enlistment)
         {
+            var asyncTransaction = AsyncTransaction.Current;
+            ArgumentNullException.ThrowIfNull(asyncTransaction);
+            this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+            ArgumentNullException.ThrowIfNull(enlistmentState);
+            foreach (var rollbackAction in enlistmentState.RollbackActions)
+            {
+                rollbackAction();
+            }
+
+            this.enlistmentStates.TryRemove(asyncTransaction, out _);
             enlistment.Done();
         }
 
@@ -5926,6 +6552,8 @@ namespace UnitTest.Master
         /// <param name="quotes">The quote row.</param>
         public async Task<IEnumerable<Quote>> UpdateAsync(IEnumerable<Quote> quotes)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var updatedRows = new List<Quote>();
             foreach (var quote in quotes)
             {
@@ -5937,16 +6565,23 @@ namespace UnitTest.Master
                     ArgumentNullException.ThrowIfNull(removedAsset);
                     await removedAsset.EnterWriteLockAsync().ConfigureAwait(false);
                     var addedAsset = this.fixture.Assets.Find(quote.AssetId);
-                    ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetQuoteIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedAsset, "AssetQuoteIndex");
                     await addedAsset.EnterWriteLockAsync().ConfigureAwait(false);
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Quote(foundRow);
+                    foundRow.Asset = addedAsset;
+                    foundRow.AssetId = quote.AssetId;
+                    foundRow.Last = quote.Last;
+                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                    removedAsset.Quotes.Remove(foundRow);
+                    addedAsset.Quotes.Add(foundRow);
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        foundRow.Asset = addedAsset;
-                        foundRow.AssetId = quote.AssetId;
-                        foundRow.Last = quote.Last;
-                        foundRow.RowVersion = this.fixture.IncrementRowVersion();
-                        removedAsset.Quotes.Remove(quote);
-                        addedAsset.Quotes.Add(quote);
+                        foundRow.CopyFrom(originalRow);
+                        removedAsset.Quotes.Add(foundRow);
+                        addedAsset.Quotes.Remove(foundRow);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Update, foundRow);
                     });
                     updatedRows.Add(foundRow);
@@ -5966,6 +6601,8 @@ namespace UnitTest.Master
         /// <param name="quote">The quote row.</param>
         public async Task<Quote> UpdateAsync(Quote quote)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue(quote.AssetId, out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(false);
@@ -5974,16 +6611,23 @@ namespace UnitTest.Master
                 ArgumentNullException.ThrowIfNull(removedAsset);
                 await removedAsset.EnterWriteLockAsync().ConfigureAwait(false);
                 var addedAsset = this.fixture.Assets.Find(quote.AssetId);
-                ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetQuoteIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAsset, "AssetQuoteIndex");
                 await addedAsset.EnterWriteLockAsync().ConfigureAwait(false);
-                this.CommitActions.Add(() =>
+                var originalRow = new Quote(foundRow);
+                foundRow.Asset = addedAsset;
+                foundRow.AssetId = quote.AssetId;
+                foundRow.Last = quote.Last;
+                foundRow.RowVersion = this.fixture.IncrementRowVersion();
+                removedAsset.Quotes.Remove(foundRow);
+                addedAsset.Quotes.Add(foundRow);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    foundRow.Asset = addedAsset;
-                    foundRow.AssetId = quote.AssetId;
-                    foundRow.Last = quote.Last;
-                    foundRow.RowVersion = this.fixture.IncrementRowVersion();
-                    removedAsset.Quotes.Remove(quote);
-                    addedAsset.Quotes.Add(quote);
+                    foundRow.CopyFrom(originalRow);
+                    removedAsset.Quotes.Add(foundRow);
+                    addedAsset.Quotes.Remove(foundRow);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Update, foundRow);
                 });
                 return foundRow;
@@ -6047,7 +6691,7 @@ namespace UnitTest.Master
                         await this.fixtureContext.SaveChangesAsync();
                     }
 
-                    asyncTransaction.Complete();
+                    asyncTransaction.Commit();
                 }
 
                 return this.Ok(quote);
@@ -6094,7 +6738,7 @@ namespace UnitTest.Master
                 var deletedRows = await this.fixture.Quotes.RemoveAsync(quotes).ConfigureAwait(false);
                 this.fixtureContext.Quotes.RemoveRange(deletedRows);
                 await this.fixtureContext.SaveChangesAsync();
-                asyncTransaction.Complete();
+                asyncTransaction.Commit();
                 return this.Ok(deletedRows);
             }
             catch (ConcurrencyException concurrencyException)
@@ -6236,7 +6880,7 @@ namespace UnitTest.Master
                 this.fixtureContext.Quotes.AddRange(addedRows);
                 this.fixtureContext.Quotes.UpdateRange(updatedRows);
                 await this.fixtureContext.SaveChangesAsync().ConfigureAwait(false);
-                asyncTransaction.Complete();
+                asyncTransaction.Commit();
                 return this.Ok(addedRows.Concat(updatedRows));
             }
             catch (ConcurrencyException concurrencyException)
@@ -6284,7 +6928,7 @@ namespace UnitTest.Master
                 {
                     this.fixtureContext.Add(addedRow);
                     await this.fixtureContext.SaveChangesAsync();
-                    asyncTransaction.Complete();
+                    asyncTransaction.Commit();
                     return this.Ok(addedRow);
                 }
 
@@ -6292,7 +6936,7 @@ namespace UnitTest.Master
                 {
                     this.fixtureContext.Update(updatedRow);
                     await this.fixtureContext.SaveChangesAsync();
-                    asyncTransaction.Complete();
+                    asyncTransaction.Commit();
                     return this.Ok(updatedRow);
                 }
 
@@ -6416,7 +7060,7 @@ namespace UnitTest.Slave
         public long RowVersion { get; set; }
 
         /// <summary>
-        /// Shallow copy of a <see cref="Account"/> row.
+        /// Deep copy of a <see cref="Account"/> row.
         /// </summary>
         /// <param name="account">The destination <see cref="Account"/> row.</param>
         public void CopyFrom(Account account)
@@ -6496,14 +7140,14 @@ namespace UnitTest.Slave
         private readonly AsyncReaderWriterLock asyncReaderWriterLock = new AsyncReaderWriterLock();
 
         /// <summary>
-        /// The commit actions for all the concurrent transactions.
-        /// </summary>
-        private ConcurrentDictionary<AsyncTransaction, List<Action>> commitDictionary = new ConcurrentDictionary<AsyncTransaction, List<Action>>();
-
-        /// <summary>
         /// The primary index.
         /// </summary>
         private readonly Dictionary<System.Guid, Account> dictionary = new Dictionary<System.Guid, Account>();
+
+        /// <summary>
+        /// The enlistment states for all the concurrent transactions.
+        /// </summary>
+        private readonly ConcurrentDictionary<AsyncTransaction, EnlistmentState> enlistmentStates = new ConcurrentDictionary<AsyncTransaction, EnlistmentState>();
 
         /// <summary>
         /// The data model.
@@ -6516,29 +7160,27 @@ namespace UnitTest.Slave
         public event EventHandler<RowChangedEventArgs>? RowChanged;
 
         /// <summary>
-        /// Gets the commit actions for the current task.
+        /// Gets the list of deleted rows.
         /// </summary>
-        private List<Action> CommitActions
+        public LinkedList<Account> DeletedRows { get; } = new LinkedList<Account>();
+
+        /// <summary>
+        /// Gets the enlistment state for the current task.
+        /// </summary>
+        private EnlistmentState? EnlistmentState
         {
             get
             {
                 var asyncTransaction = AsyncTransaction.Current;
-                ArgumentNullException.ThrowIfNull(asyncTransaction);
-                if (asyncTransaction.CancellationToken.IsCancellationRequested)
+                if (asyncTransaction == null)
                 {
-                    throw new OperationCanceledException();
+                    return null;
                 }
 
-                this.commitDictionary.TryGetValue(asyncTransaction, out var commitActions);
-                ArgumentNullException.ThrowIfNull(commitActions);
-                return commitActions;
+                this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+                return enlistmentState;
             }
         }
-
-        /// <summary>
-        /// Gets the list of deleted rows.
-        /// </summary>
-        public LinkedList<Account> DeletedRows { get; } = new LinkedList<Account>();
 
         /// <summary>
         /// Adds a <see cref="Account"/> row.
@@ -6547,24 +7189,37 @@ namespace UnitTest.Slave
         /// <returns>The added <see cref="Account"/> row.</returns>
         public async Task<Account> AddAsync(Account account)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             Model? addedModel = null;
             if (account.ModelId != null)
             {
                 addedModel = this.fixture.Models.Find(account.ModelId.Value);
-                ConstraintException.ThrowIfNull(addedModel, "The action conflicted with the ModelAccountIndex constraint.");
+                ConstraintException.ThrowIfNull(addedModel, "ModelAccountIndex");
                 await addedModel.EnterWriteLockAsync().ConfigureAwait(true);
             }
 
-            this.CommitActions.Add(() =>
+            var originalRow = new Account(account);
+            account.Model = addedModel;
+            this.fixture.RowVersion = account.RowVersion;
+            if (addedModel != null)
             {
-                account.Model = addedModel;
-                this.fixture.RowVersion = account.RowVersion;
+                addedModel.Accounts.Add(account);
+            }
+
+            this.dictionary.Add(account.AccountId, account);
+            enlistmentState.RollbackActions.Add(() =>
+            {
+                account.CopyFrom(originalRow);
                 if (addedModel != null)
                 {
-                    addedModel.Accounts.Add(account);
+                    addedModel.Accounts.Remove(account);
                 }
 
-                this.dictionary.Add(account.AccountId, account);
+                this.dictionary.Remove(account.AccountId);
+            });
+            enlistmentState.CommitActions.Add(() =>
+            {
                 this.OnRowChanged(DataAction.Add, account);
             });
             return account;
@@ -6577,6 +7232,8 @@ namespace UnitTest.Slave
         /// <returns>The added <see cref="Account"/> rows.</returns>
         public async Task<IEnumerable<Account>> AddAsync(IEnumerable<Account> accounts)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var addedRows = new List<Account>();
             foreach (var account in accounts)
             {
@@ -6584,20 +7241,31 @@ namespace UnitTest.Slave
                 if (account.ModelId != null)
                 {
                     addedModel = this.fixture.Models.Find(account.ModelId.Value);
-                    ConstraintException.ThrowIfNull(addedModel, "The action conflicted with the ModelAccountIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedModel, "ModelAccountIndex");
                     await addedModel.EnterWriteLockAsync().ConfigureAwait(true);
                 }
 
-                this.CommitActions.Add(() =>
+                var originalRow = new Account(account);
+                account.Model = addedModel;
+                this.fixture.RowVersion = account.RowVersion;
+                if (addedModel != null)
                 {
-                    account.Model = addedModel;
-                    this.fixture.RowVersion = account.RowVersion;
+                    addedModel.Accounts.Add(account);
+                }
+
+                this.dictionary.Add(account.AccountId, account);
+                enlistmentState.RollbackActions.Add(() =>
+                {
+                    account.CopyFrom(originalRow);
                     if (addedModel != null)
                     {
-                        addedModel.Accounts.Add(account);
+                        addedModel.Accounts.Remove(account);
                     }
 
-                    this.dictionary.Add(account.AccountId, account);
+                    this.dictionary.Remove(account.AccountId);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Add, account);
                 });
                 addedRows.Add(account);
@@ -6611,14 +7279,14 @@ namespace UnitTest.Slave
         {
             var asyncTransaction = AsyncTransaction.Current;
             ArgumentNullException.ThrowIfNull(asyncTransaction);
-            this.commitDictionary.TryGetValue(asyncTransaction, out var commitActions);
-            ArgumentNullException.ThrowIfNull(commitActions);
-            foreach (var commitAction in commitActions)
+            this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+            ArgumentNullException.ThrowIfNull(enlistmentState);
+            foreach (var commitAction in enlistmentState.CommitActions)
             {
                 commitAction();
             }
 
-            this.commitDictionary.TryRemove(asyncTransaction, out _);
+            this.enlistmentStates.TryRemove(asyncTransaction, out _);
             enlistment.Done();
         }
 
@@ -6635,7 +7303,7 @@ namespace UnitTest.Slave
                 await this.asyncReaderWriterLock.EnterReadLockAsync(asyncTransaction.CancellationToken).ConfigureAwait(false);
                 asyncTransaction.ReadLocks.Add(this, this.asyncReaderWriterLock);
                 asyncTransaction.EnlistVolatile(this);
-                this.commitDictionary.TryAdd(asyncTransaction, new List<Action>());
+                this.enlistmentStates.TryAdd(asyncTransaction, new EnlistmentState());
             }
         }
 
@@ -6660,7 +7328,7 @@ namespace UnitTest.Slave
                     await this.asyncReaderWriterLock.EnterWriteLockAsync(asyncTransaction.CancellationToken).ConfigureAwait(false);
                     asyncTransaction.WriteLocks.Add(this, this.asyncReaderWriterLock);
                     asyncTransaction.EnlistVolatile(this);
-                    this.commitDictionary.TryAdd(asyncTransaction, new List<Action>());
+                    this.enlistmentStates.TryAdd(asyncTransaction, new EnlistmentState());
                 }
             }
         }
@@ -6710,7 +7378,7 @@ namespace UnitTest.Slave
                     var model = this.fixture.Models.Find(account.ModelId.Value);
                     if (model == null)
                     {
-                        throw new ConstraintException("The insert action conflicted with the constraint ModelAccountIndex");
+                        throw new ConstraintException("ModelAccountIndex");
                     }
 
                     model.Accounts.Add(account);
@@ -6749,6 +7417,8 @@ namespace UnitTest.Slave
         /// <returns>The patched <see cref="Account"/> rows.</returns>
         public async Task<(IEnumerable<Account> AddedRows, IEnumerable<Account> UpdatedRows)> PatchAsync(IEnumerable<Account> accounts)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var addedRows = new List<Account>();
             var updatedRows = new List<Account>();
             foreach (var account in accounts)
@@ -6768,27 +7438,41 @@ namespace UnitTest.Slave
                     if (account.ModelId != null)
                     {
                         addedModel = this.fixture.Models.Find(account.ModelId.Value);
-                        ConstraintException.ThrowIfNull(addedModel, "The action conflicted with the ModelAccountIndex constraint.");
+                        ConstraintException.ThrowIfNull(addedModel, "ModelAccountIndex");
                         await addedModel.EnterWriteLockAsync().ConfigureAwait(true);
                     }
 
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Account(foundRow);
+                    foundRow.AccountId = account.AccountId;
+                    foundRow.Model = addedModel;
+                    foundRow.ModelId = account.ModelId;
+                    foundRow.Name = account.Name;
+                    foundRow.RowVersion = account.RowVersion;
+                    if (removedModel != null)
                     {
-                        foundRow.AccountId = account.AccountId;
-                        foundRow.Model = addedModel;
-                        foundRow.ModelId = account.ModelId;
-                        foundRow.Name = account.Name;
-                        foundRow.RowVersion = account.RowVersion;
+                        removedModel.Accounts.Remove(foundRow);
+                    }
+
+                    if (addedModel != null)
+                    {
+                        addedModel.Accounts.Add(foundRow);
+                    }
+
+                    enlistmentState.RollbackActions.Add(() =>
+                    {
+                        foundRow.CopyFrom(originalRow);
                         if (removedModel != null)
                         {
-                            removedModel.Accounts.Remove(account);
+                            removedModel.Accounts.Add(foundRow);
                         }
 
                         if (addedModel != null)
                         {
-                            addedModel.Accounts.Add(account);
+                            addedModel.Accounts.Remove(foundRow);
                         }
-
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Update, foundRow);
                     });
                     updatedRows.Add(foundRow);
@@ -6799,20 +7483,31 @@ namespace UnitTest.Slave
                     if (account.ModelId != null)
                     {
                         addedModel = this.fixture.Models.Find(account.ModelId.Value);
-                        ConstraintException.ThrowIfNull(addedModel, "The action conflicted with the ModelAccountIndex constraint.");
+                        ConstraintException.ThrowIfNull(addedModel, "ModelAccountIndex");
                         await addedModel.EnterWriteLockAsync().ConfigureAwait(true);
                     }
 
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Account(account);
+                    account.Model = addedModel;
+                    this.fixture.RowVersion = account.RowVersion;
+                    if (addedModel != null)
                     {
-                        account.Model = addedModel;
-                        this.fixture.RowVersion = account.RowVersion;
+                        addedModel.Accounts.Add(account);
+                    }
+
+                    this.dictionary.Add(account.AccountId, account);
+                    enlistmentState.RollbackActions.Add(() =>
+                    {
+                        account.CopyFrom(originalRow);
                         if (addedModel != null)
                         {
-                            addedModel.Accounts.Add(account);
+                            addedModel.Accounts.Remove(account);
                         }
 
-                        this.dictionary.Add(account.AccountId, account);
+                        this.dictionary.Remove(account.AccountId);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Add, account);
                     });
                     addedRows.Add(account);
@@ -6835,6 +7530,8 @@ namespace UnitTest.Slave
         /// <returns>The added or updated <see cref="Account"/> row.</returns>
         public async Task<(Account? AddedRow, Account? UpdatedRow)> PutAsync(Account account)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue(account.AccountId, out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
@@ -6850,27 +7547,41 @@ namespace UnitTest.Slave
                 if (account.ModelId != null)
                 {
                     addedModel = this.fixture.Models.Find(account.ModelId.Value);
-                    ConstraintException.ThrowIfNull(addedModel, "The action conflicted with the ModelAccountIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedModel, "ModelAccountIndex");
                     await addedModel.EnterWriteLockAsync().ConfigureAwait(true);
                 }
 
-                this.CommitActions.Add(() =>
+                var originalRow = new Account(foundRow);
+                foundRow.AccountId = account.AccountId;
+                foundRow.Model = addedModel;
+                foundRow.ModelId = account.ModelId;
+                foundRow.Name = account.Name;
+                foundRow.RowVersion = account.RowVersion;
+                if (removedModel != null)
                 {
-                    foundRow.AccountId = account.AccountId;
-                    foundRow.Model = addedModel;
-                    foundRow.ModelId = account.ModelId;
-                    foundRow.Name = account.Name;
-                    foundRow.RowVersion = account.RowVersion;
+                    removedModel.Accounts.Remove(foundRow);
+                }
+
+                if (addedModel != null)
+                {
+                    addedModel.Accounts.Add(foundRow);
+                }
+
+                enlistmentState.RollbackActions.Add(() =>
+                {
+                    foundRow.CopyFrom(originalRow);
                     if (removedModel != null)
                     {
-                        removedModel.Accounts.Remove(account);
+                        removedModel.Accounts.Add(foundRow);
                     }
 
                     if (addedModel != null)
                     {
-                        addedModel.Accounts.Add(account);
+                        addedModel.Accounts.Remove(foundRow);
                     }
-
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Update, foundRow);
                 });
                 return (AddedRow: null, UpdatedRow: foundRow);
@@ -6881,20 +7592,31 @@ namespace UnitTest.Slave
                 if (account.ModelId != null)
                 {
                     addedModel = this.fixture.Models.Find(account.ModelId.Value);
-                    ConstraintException.ThrowIfNull(addedModel, "The action conflicted with the ModelAccountIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedModel, "ModelAccountIndex");
                     await addedModel.EnterWriteLockAsync().ConfigureAwait(true);
                 }
 
-                this.CommitActions.Add(() =>
+                var originalRow = new Account(account);
+                account.Model = addedModel;
+                this.fixture.RowVersion = account.RowVersion;
+                if (addedModel != null)
                 {
-                    account.Model = addedModel;
-                    this.fixture.RowVersion = account.RowVersion;
+                    addedModel.Accounts.Add(account);
+                }
+
+                this.dictionary.Add(account.AccountId, account);
+                enlistmentState.RollbackActions.Add(() =>
+                {
+                    account.CopyFrom(originalRow);
                     if (addedModel != null)
                     {
-                        addedModel.Accounts.Add(account);
+                        addedModel.Accounts.Remove(account);
                     }
 
-                    this.dictionary.Add(account.AccountId, account);
+                    this.dictionary.Remove(account.AccountId);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Add, account);
                 });
                 return (AddedRow: account, UpdatedRow: null);
@@ -6908,12 +7630,16 @@ namespace UnitTest.Slave
         /// <returns>The removed <see cref="Account"/> rows.</returns>
         public async Task<IEnumerable<Account>> RemoveAsync(IEnumerable<Account> accounts)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var removedRows = new List<Account>();
             foreach (var account in accounts)
             {
                 if (this.dictionary.TryGetValue(account.AccountId, out var foundRow))
                 {
                     await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
+                    ConstraintException.ThrowIfTrue(foundRow.Orders.Count != 0, "AccountOrderIndex");
+                    ConstraintException.ThrowIfTrue(foundRow.Positions.Count != 0, "AccountPositionIndex");
                     Model? removedModel = null;
                     if (account.ModelId != null)
                     {
@@ -6922,16 +7648,27 @@ namespace UnitTest.Slave
                         await removedModel.EnterWriteLockAsync().ConfigureAwait(true);
                     }
 
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Account(foundRow);
+                    foundRow.Model = null;
+                    foundRow.RowVersion = account.RowVersion;
+                    if (removedModel != null)
                     {
-                        foundRow.Model = null;
-                        foundRow.RowVersion = account.RowVersion;
+                        removedModel.Accounts.Remove(foundRow);
+                    }
+
+                    this.dictionary.Remove(foundRow.AccountId);
+                    enlistmentState.RollbackActions.Add(() =>
+                    {
+                        foundRow.CopyFrom(originalRow);
                         if (removedModel != null)
                         {
-                            removedModel.Accounts.Remove(account);
+                            removedModel.Accounts.Add(foundRow);
                         }
 
-                        this.dictionary.Remove(foundRow.AccountId);
+                        this.dictionary.Add(foundRow.AccountId, foundRow);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.DeletedRows.AddFirst(foundRow);
                         this.OnRowChanged(DataAction.Remove, foundRow);
                     });
@@ -6949,9 +7686,13 @@ namespace UnitTest.Slave
         /// <returns>The removed <see cref="Account"/> row.</returns>
         public async Task<Account?> RemoveAsync(Account account)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue(account.AccountId, out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
+                ConstraintException.ThrowIfTrue(foundRow.Orders.Count != 0, "AccountOrderIndex");
+                ConstraintException.ThrowIfTrue(foundRow.Positions.Count != 0, "AccountPositionIndex");
                 Model? removedModel = null;
                 if (account.ModelId != null)
                 {
@@ -6960,16 +7701,27 @@ namespace UnitTest.Slave
                     await removedModel.EnterWriteLockAsync().ConfigureAwait(true);
                 }
 
-                this.CommitActions.Add(() =>
+                var originalRow = new Account(foundRow);
+                foundRow.Model = null;
+                foundRow.RowVersion = account.RowVersion;
+                if (removedModel != null)
                 {
-                    foundRow.Model = null;
-                    foundRow.RowVersion = account.RowVersion;
+                    removedModel.Accounts.Remove(foundRow);
+                }
+
+                this.dictionary.Remove(foundRow.AccountId);
+                enlistmentState.RollbackActions.Add(() =>
+                {
+                    foundRow.CopyFrom(originalRow);
                     if (removedModel != null)
                     {
-                        removedModel.Accounts.Remove(account);
+                        removedModel.Accounts.Add(foundRow);
                     }
 
-                    this.dictionary.Remove(foundRow.AccountId);
+                    this.dictionary.Add(foundRow.AccountId, foundRow);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.DeletedRows.AddFirst(foundRow);
                     this.OnRowChanged(DataAction.Remove, foundRow);
                 });
@@ -6984,6 +7736,16 @@ namespace UnitTest.Slave
         /// <inheritdoc/>
         public void Rollback(Enlistment enlistment)
         {
+            var asyncTransaction = AsyncTransaction.Current;
+            ArgumentNullException.ThrowIfNull(asyncTransaction);
+            this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+            ArgumentNullException.ThrowIfNull(enlistmentState);
+            foreach (var rollbackAction in enlistmentState.RollbackActions)
+            {
+                rollbackAction();
+            }
+
+            this.enlistmentStates.TryRemove(asyncTransaction, out _);
             enlistment.Done();
         }
 
@@ -6993,6 +7755,8 @@ namespace UnitTest.Slave
         /// <param name="accounts">The account row.</param>
         public async Task<IEnumerable<Account>> UpdateAsync(IEnumerable<Account> accounts)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var updatedRows = new List<Account>();
             foreach (var account in accounts)
             {
@@ -7011,27 +7775,41 @@ namespace UnitTest.Slave
                     if (account.ModelId != null)
                     {
                         addedModel = this.fixture.Models.Find(account.ModelId.Value);
-                        ConstraintException.ThrowIfNull(addedModel, "The action conflicted with the ModelAccountIndex constraint.");
+                        ConstraintException.ThrowIfNull(addedModel, "ModelAccountIndex");
                         await addedModel.EnterWriteLockAsync().ConfigureAwait(true);
                     }
 
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Account(foundRow);
+                    foundRow.AccountId = account.AccountId;
+                    foundRow.Model = addedModel;
+                    foundRow.ModelId = account.ModelId;
+                    foundRow.Name = account.Name;
+                    foundRow.RowVersion = account.RowVersion;
+                    if (removedModel != null)
                     {
-                        foundRow.AccountId = account.AccountId;
-                        foundRow.Model = addedModel;
-                        foundRow.ModelId = account.ModelId;
-                        foundRow.Name = account.Name;
-                        foundRow.RowVersion = account.RowVersion;
+                        removedModel.Accounts.Remove(foundRow);
+                    }
+
+                    if (addedModel != null)
+                    {
+                        addedModel.Accounts.Add(foundRow);
+                    }
+
+                    enlistmentState.RollbackActions.Add(() =>
+                    {
+                        foundRow.CopyFrom(originalRow);
                         if (removedModel != null)
                         {
-                            removedModel.Accounts.Remove(account);
+                            removedModel.Accounts.Add(foundRow);
                         }
 
                         if (addedModel != null)
                         {
-                            addedModel.Accounts.Add(account);
+                            addedModel.Accounts.Remove(foundRow);
                         }
-
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Update, foundRow);
                     });
                     updatedRows.Add(foundRow);
@@ -7051,6 +7829,8 @@ namespace UnitTest.Slave
         /// <param name="account">The account row.</param>
         public async Task<Account> UpdateAsync(Account account)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue(account.AccountId, out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
@@ -7066,27 +7846,41 @@ namespace UnitTest.Slave
                 if (account.ModelId != null)
                 {
                     addedModel = this.fixture.Models.Find(account.ModelId.Value);
-                    ConstraintException.ThrowIfNull(addedModel, "The action conflicted with the ModelAccountIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedModel, "ModelAccountIndex");
                     await addedModel.EnterWriteLockAsync().ConfigureAwait(true);
                 }
 
-                this.CommitActions.Add(() =>
+                var originalRow = new Account(foundRow);
+                foundRow.AccountId = account.AccountId;
+                foundRow.Model = addedModel;
+                foundRow.ModelId = account.ModelId;
+                foundRow.Name = account.Name;
+                foundRow.RowVersion = account.RowVersion;
+                if (removedModel != null)
                 {
-                    foundRow.AccountId = account.AccountId;
-                    foundRow.Model = addedModel;
-                    foundRow.ModelId = account.ModelId;
-                    foundRow.Name = account.Name;
-                    foundRow.RowVersion = account.RowVersion;
+                    removedModel.Accounts.Remove(foundRow);
+                }
+
+                if (addedModel != null)
+                {
+                    addedModel.Accounts.Add(foundRow);
+                }
+
+                enlistmentState.RollbackActions.Add(() =>
+                {
+                    foundRow.CopyFrom(originalRow);
                     if (removedModel != null)
                     {
-                        removedModel.Accounts.Remove(account);
+                        removedModel.Accounts.Add(foundRow);
                     }
 
                     if (addedModel != null)
                     {
-                        addedModel.Accounts.Add(account);
+                        addedModel.Accounts.Remove(foundRow);
                     }
-
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Update, foundRow);
                 });
                 return foundRow;
@@ -7166,7 +7960,7 @@ namespace UnitTest.Slave
         public long RowVersion { get; set; }
 
         /// <summary>
-        /// Shallow copy of a <see cref="Asset"/> row.
+        /// Deep copy of a <see cref="Asset"/> row.
         /// </summary>
         /// <param name="asset">The destination <see cref="Asset"/> row.</param>
         public void CopyFrom(Asset asset)
@@ -7246,14 +8040,14 @@ namespace UnitTest.Slave
         private readonly AsyncReaderWriterLock asyncReaderWriterLock = new AsyncReaderWriterLock();
 
         /// <summary>
-        /// The commit actions for all the concurrent transactions.
-        /// </summary>
-        private ConcurrentDictionary<AsyncTransaction, List<Action>> commitDictionary = new ConcurrentDictionary<AsyncTransaction, List<Action>>();
-
-        /// <summary>
         /// The primary index.
         /// </summary>
         private readonly Dictionary<System.Guid, Asset> dictionary = new Dictionary<System.Guid, Asset>();
+
+        /// <summary>
+        /// The enlistment states for all the concurrent transactions.
+        /// </summary>
+        private readonly ConcurrentDictionary<AsyncTransaction, EnlistmentState> enlistmentStates = new ConcurrentDictionary<AsyncTransaction, EnlistmentState>();
 
         /// <summary>
         /// The data model.
@@ -7266,29 +8060,27 @@ namespace UnitTest.Slave
         public event EventHandler<RowChangedEventArgs>? RowChanged;
 
         /// <summary>
-        /// Gets the commit actions for the current task.
+        /// Gets the list of deleted rows.
         /// </summary>
-        private List<Action> CommitActions
+        public LinkedList<Asset> DeletedRows { get; } = new LinkedList<Asset>();
+
+        /// <summary>
+        /// Gets the enlistment state for the current task.
+        /// </summary>
+        private EnlistmentState? EnlistmentState
         {
             get
             {
                 var asyncTransaction = AsyncTransaction.Current;
-                ArgumentNullException.ThrowIfNull(asyncTransaction);
-                if (asyncTransaction.CancellationToken.IsCancellationRequested)
+                if (asyncTransaction == null)
                 {
-                    throw new OperationCanceledException();
+                    return null;
                 }
 
-                this.commitDictionary.TryGetValue(asyncTransaction, out var commitActions);
-                ArgumentNullException.ThrowIfNull(commitActions);
-                return commitActions;
+                this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+                return enlistmentState;
             }
         }
-
-        /// <summary>
-        /// Gets the list of deleted rows.
-        /// </summary>
-        public LinkedList<Asset> DeletedRows { get; } = new LinkedList<Asset>();
 
         /// <summary>
         /// Adds a <see cref="Asset"/> row.
@@ -7297,10 +8089,18 @@ namespace UnitTest.Slave
         /// <returns>The added <see cref="Asset"/> row.</returns>
         public Task<Asset> AddAsync(Asset asset)
         {
-            this.CommitActions.Add(() =>
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
+            var originalRow = new Asset(asset);
+            this.fixture.RowVersion = asset.RowVersion;
+            this.dictionary.Add(asset.AssetId, asset);
+            enlistmentState.RollbackActions.Add(() =>
             {
-                this.fixture.RowVersion = asset.RowVersion;
-                this.dictionary.Add(asset.AssetId, asset);
+                asset.CopyFrom(originalRow);
+                this.dictionary.Remove(asset.AssetId);
+            });
+            enlistmentState.CommitActions.Add(() =>
+            {
                 this.OnRowChanged(DataAction.Add, asset);
             });
             return Task.FromResult(asset);
@@ -7313,13 +8113,21 @@ namespace UnitTest.Slave
         /// <returns>The added <see cref="Asset"/> rows.</returns>
         public Task<IEnumerable<Asset>> AddAsync(IEnumerable<Asset> assets)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var addedRows = new List<Asset>();
             foreach (var asset in assets)
             {
-                this.CommitActions.Add(() =>
+                var originalRow = new Asset(asset);
+                this.fixture.RowVersion = asset.RowVersion;
+                this.dictionary.Add(asset.AssetId, asset);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    this.fixture.RowVersion = asset.RowVersion;
-                    this.dictionary.Add(asset.AssetId, asset);
+                    asset.CopyFrom(originalRow);
+                    this.dictionary.Remove(asset.AssetId);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Add, asset);
                 });
                 addedRows.Add(asset);
@@ -7333,14 +8141,14 @@ namespace UnitTest.Slave
         {
             var asyncTransaction = AsyncTransaction.Current;
             ArgumentNullException.ThrowIfNull(asyncTransaction);
-            this.commitDictionary.TryGetValue(asyncTransaction, out var commitActions);
-            ArgumentNullException.ThrowIfNull(commitActions);
-            foreach (var commitAction in commitActions)
+            this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+            ArgumentNullException.ThrowIfNull(enlistmentState);
+            foreach (var commitAction in enlistmentState.CommitActions)
             {
                 commitAction();
             }
 
-            this.commitDictionary.TryRemove(asyncTransaction, out _);
+            this.enlistmentStates.TryRemove(asyncTransaction, out _);
             enlistment.Done();
         }
 
@@ -7357,7 +8165,7 @@ namespace UnitTest.Slave
                 await this.asyncReaderWriterLock.EnterReadLockAsync(asyncTransaction.CancellationToken).ConfigureAwait(false);
                 asyncTransaction.ReadLocks.Add(this, this.asyncReaderWriterLock);
                 asyncTransaction.EnlistVolatile(this);
-                this.commitDictionary.TryAdd(asyncTransaction, new List<Action>());
+                this.enlistmentStates.TryAdd(asyncTransaction, new EnlistmentState());
             }
         }
 
@@ -7382,7 +8190,7 @@ namespace UnitTest.Slave
                     await this.asyncReaderWriterLock.EnterWriteLockAsync(asyncTransaction.CancellationToken).ConfigureAwait(false);
                     asyncTransaction.WriteLocks.Add(this, this.asyncReaderWriterLock);
                     asyncTransaction.EnlistVolatile(this);
-                    this.commitDictionary.TryAdd(asyncTransaction, new List<Action>());
+                    this.enlistmentStates.TryAdd(asyncTransaction, new EnlistmentState());
                 }
             }
         }
@@ -7455,6 +8263,8 @@ namespace UnitTest.Slave
         /// <returns>The patched <see cref="Asset"/> rows.</returns>
         public async Task<(IEnumerable<Asset> AddedRows, IEnumerable<Asset> UpdatedRows)> PatchAsync(IEnumerable<Asset> assets)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var addedRows = new List<Asset>();
             var updatedRows = new List<Asset>();
             foreach (var asset in assets)
@@ -7462,21 +8272,32 @@ namespace UnitTest.Slave
                 if (this.dictionary.TryGetValue(asset.AssetId, out var foundRow))
                 {
                     await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Asset(foundRow);
+                    foundRow.AssetId = asset.AssetId;
+                    foundRow.Name = asset.Name;
+                    foundRow.RowVersion = asset.RowVersion;
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        foundRow.AssetId = asset.AssetId;
-                        foundRow.Name = asset.Name;
-                        foundRow.RowVersion = asset.RowVersion;
+                        foundRow.CopyFrom(originalRow);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Update, foundRow);
                     });
                     updatedRows.Add(foundRow);
                 }
                 else
                 {
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Asset(asset);
+                    this.fixture.RowVersion = asset.RowVersion;
+                    this.dictionary.Add(asset.AssetId, asset);
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        this.fixture.RowVersion = asset.RowVersion;
-                        this.dictionary.Add(asset.AssetId, asset);
+                        asset.CopyFrom(originalRow);
+                        this.dictionary.Remove(asset.AssetId);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Add, asset);
                     });
                     addedRows.Add(asset);
@@ -7499,24 +8320,37 @@ namespace UnitTest.Slave
         /// <returns>The added or updated <see cref="Asset"/> row.</returns>
         public async Task<(Asset? AddedRow, Asset? UpdatedRow)> PutAsync(Asset asset)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue(asset.AssetId, out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
-                this.CommitActions.Add(() =>
+                var originalRow = new Asset(foundRow);
+                foundRow.AssetId = asset.AssetId;
+                foundRow.Name = asset.Name;
+                foundRow.RowVersion = asset.RowVersion;
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    foundRow.AssetId = asset.AssetId;
-                    foundRow.Name = asset.Name;
-                    foundRow.RowVersion = asset.RowVersion;
+                    foundRow.CopyFrom(originalRow);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Update, foundRow);
                 });
                 return (AddedRow: null, UpdatedRow: foundRow);
             }
             else
             {
-                this.CommitActions.Add(() =>
+                var originalRow = new Asset(asset);
+                this.fixture.RowVersion = asset.RowVersion;
+                this.dictionary.Add(asset.AssetId, asset);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    this.fixture.RowVersion = asset.RowVersion;
-                    this.dictionary.Add(asset.AssetId, asset);
+                    asset.CopyFrom(originalRow);
+                    this.dictionary.Remove(asset.AssetId);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Add, asset);
                 });
                 return (AddedRow: asset, UpdatedRow: null);
@@ -7530,16 +8364,27 @@ namespace UnitTest.Slave
         /// <returns>The removed <see cref="Asset"/> rows.</returns>
         public async Task<IEnumerable<Asset>> RemoveAsync(IEnumerable<Asset> assets)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var removedRows = new List<Asset>();
             foreach (var asset in assets)
             {
                 if (this.dictionary.TryGetValue(asset.AssetId, out var foundRow))
                 {
                     await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
-                    this.CommitActions.Add(() =>
+                    ConstraintException.ThrowIfTrue(foundRow.Orders.Count != 0, "AssetOrderIndex");
+                    ConstraintException.ThrowIfTrue(foundRow.Positions.Count != 0, "AssetPositionIndex");
+                    ConstraintException.ThrowIfTrue(foundRow.Quotes.Count != 0, "AssetQuoteIndex");
+                    var originalRow = new Asset(foundRow);
+                    foundRow.RowVersion = asset.RowVersion;
+                    this.dictionary.Remove(foundRow.AssetId);
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        foundRow.RowVersion = asset.RowVersion;
-                        this.dictionary.Remove(foundRow.AssetId);
+                        foundRow.CopyFrom(originalRow);
+                        this.dictionary.Add(foundRow.AssetId, foundRow);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.DeletedRows.AddFirst(foundRow);
                         this.OnRowChanged(DataAction.Remove, foundRow);
                     });
@@ -7557,13 +8402,24 @@ namespace UnitTest.Slave
         /// <returns>The removed <see cref="Asset"/> row.</returns>
         public async Task<Asset?> RemoveAsync(Asset asset)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue(asset.AssetId, out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
-                this.CommitActions.Add(() =>
+                ConstraintException.ThrowIfTrue(foundRow.Orders.Count != 0, "AssetOrderIndex");
+                ConstraintException.ThrowIfTrue(foundRow.Positions.Count != 0, "AssetPositionIndex");
+                ConstraintException.ThrowIfTrue(foundRow.Quotes.Count != 0, "AssetQuoteIndex");
+                var originalRow = new Asset(foundRow);
+                foundRow.RowVersion = asset.RowVersion;
+                this.dictionary.Remove(foundRow.AssetId);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    foundRow.RowVersion = asset.RowVersion;
-                    this.dictionary.Remove(foundRow.AssetId);
+                    foundRow.CopyFrom(originalRow);
+                    this.dictionary.Add(foundRow.AssetId, foundRow);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.DeletedRows.AddFirst(foundRow);
                     this.OnRowChanged(DataAction.Remove, foundRow);
                 });
@@ -7578,6 +8434,16 @@ namespace UnitTest.Slave
         /// <inheritdoc/>
         public void Rollback(Enlistment enlistment)
         {
+            var asyncTransaction = AsyncTransaction.Current;
+            ArgumentNullException.ThrowIfNull(asyncTransaction);
+            this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+            ArgumentNullException.ThrowIfNull(enlistmentState);
+            foreach (var rollbackAction in enlistmentState.RollbackActions)
+            {
+                rollbackAction();
+            }
+
+            this.enlistmentStates.TryRemove(asyncTransaction, out _);
             enlistment.Done();
         }
 
@@ -7587,17 +8453,24 @@ namespace UnitTest.Slave
         /// <param name="assets">The asset row.</param>
         public async Task<IEnumerable<Asset>> UpdateAsync(IEnumerable<Asset> assets)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var updatedRows = new List<Asset>();
             foreach (var asset in assets)
             {
                 if (this.dictionary.TryGetValue(asset.AssetId, out var foundRow))
                 {
                     await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Asset(foundRow);
+                    foundRow.AssetId = asset.AssetId;
+                    foundRow.Name = asset.Name;
+                    foundRow.RowVersion = asset.RowVersion;
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        foundRow.AssetId = asset.AssetId;
-                        foundRow.Name = asset.Name;
-                        foundRow.RowVersion = asset.RowVersion;
+                        foundRow.CopyFrom(originalRow);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Update, foundRow);
                     });
                     updatedRows.Add(foundRow);
@@ -7617,14 +8490,21 @@ namespace UnitTest.Slave
         /// <param name="asset">The asset row.</param>
         public async Task<Asset> UpdateAsync(Asset asset)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue(asset.AssetId, out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
-                this.CommitActions.Add(() =>
+                var originalRow = new Asset(foundRow);
+                foundRow.AssetId = asset.AssetId;
+                foundRow.Name = asset.Name;
+                foundRow.RowVersion = asset.RowVersion;
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    foundRow.AssetId = asset.AssetId;
-                    foundRow.Name = asset.Name;
-                    foundRow.RowVersion = asset.RowVersion;
+                    foundRow.CopyFrom(originalRow);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Update, foundRow);
                 });
                 return foundRow;
@@ -8482,7 +9362,7 @@ namespace UnitTest.Slave
         public long RowVersion { get; set; }
 
         /// <summary>
-        /// Shallow copy of a <see cref="Model"/> row.
+        /// Deep copy of a <see cref="Model"/> row.
         /// </summary>
         /// <param name="model">The destination <see cref="Model"/> row.</param>
         public void CopyFrom(Model model)
@@ -8558,14 +9438,14 @@ namespace UnitTest.Slave
         private readonly AsyncReaderWriterLock asyncReaderWriterLock = new AsyncReaderWriterLock();
 
         /// <summary>
-        /// The commit actions for all the concurrent transactions.
-        /// </summary>
-        private ConcurrentDictionary<AsyncTransaction, List<Action>> commitDictionary = new ConcurrentDictionary<AsyncTransaction, List<Action>>();
-
-        /// <summary>
         /// The primary index.
         /// </summary>
         private readonly Dictionary<System.Guid, Model> dictionary = new Dictionary<System.Guid, Model>();
+
+        /// <summary>
+        /// The enlistment states for all the concurrent transactions.
+        /// </summary>
+        private readonly ConcurrentDictionary<AsyncTransaction, EnlistmentState> enlistmentStates = new ConcurrentDictionary<AsyncTransaction, EnlistmentState>();
 
         /// <summary>
         /// The data model.
@@ -8578,29 +9458,27 @@ namespace UnitTest.Slave
         public event EventHandler<RowChangedEventArgs>? RowChanged;
 
         /// <summary>
-        /// Gets the commit actions for the current task.
+        /// Gets the list of deleted rows.
         /// </summary>
-        private List<Action> CommitActions
+        public LinkedList<Model> DeletedRows { get; } = new LinkedList<Model>();
+
+        /// <summary>
+        /// Gets the enlistment state for the current task.
+        /// </summary>
+        private EnlistmentState? EnlistmentState
         {
             get
             {
                 var asyncTransaction = AsyncTransaction.Current;
-                ArgumentNullException.ThrowIfNull(asyncTransaction);
-                if (asyncTransaction.CancellationToken.IsCancellationRequested)
+                if (asyncTransaction == null)
                 {
-                    throw new OperationCanceledException();
+                    return null;
                 }
 
-                this.commitDictionary.TryGetValue(asyncTransaction, out var commitActions);
-                ArgumentNullException.ThrowIfNull(commitActions);
-                return commitActions;
+                this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+                return enlistmentState;
             }
         }
-
-        /// <summary>
-        /// Gets the list of deleted rows.
-        /// </summary>
-        public LinkedList<Model> DeletedRows { get; } = new LinkedList<Model>();
 
         /// <summary>
         /// Adds a <see cref="Model"/> row.
@@ -8609,10 +9487,18 @@ namespace UnitTest.Slave
         /// <returns>The added <see cref="Model"/> row.</returns>
         public Task<Model> AddAsync(Model model)
         {
-            this.CommitActions.Add(() =>
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
+            var originalRow = new Model(model);
+            this.fixture.RowVersion = model.RowVersion;
+            this.dictionary.Add(model.ModelId, model);
+            enlistmentState.RollbackActions.Add(() =>
             {
-                this.fixture.RowVersion = model.RowVersion;
-                this.dictionary.Add(model.ModelId, model);
+                model.CopyFrom(originalRow);
+                this.dictionary.Remove(model.ModelId);
+            });
+            enlistmentState.CommitActions.Add(() =>
+            {
                 this.OnRowChanged(DataAction.Add, model);
             });
             return Task.FromResult(model);
@@ -8625,13 +9511,21 @@ namespace UnitTest.Slave
         /// <returns>The added <see cref="Model"/> rows.</returns>
         public Task<IEnumerable<Model>> AddAsync(IEnumerable<Model> models)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var addedRows = new List<Model>();
             foreach (var model in models)
             {
-                this.CommitActions.Add(() =>
+                var originalRow = new Model(model);
+                this.fixture.RowVersion = model.RowVersion;
+                this.dictionary.Add(model.ModelId, model);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    this.fixture.RowVersion = model.RowVersion;
-                    this.dictionary.Add(model.ModelId, model);
+                    model.CopyFrom(originalRow);
+                    this.dictionary.Remove(model.ModelId);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Add, model);
                 });
                 addedRows.Add(model);
@@ -8645,14 +9539,14 @@ namespace UnitTest.Slave
         {
             var asyncTransaction = AsyncTransaction.Current;
             ArgumentNullException.ThrowIfNull(asyncTransaction);
-            this.commitDictionary.TryGetValue(asyncTransaction, out var commitActions);
-            ArgumentNullException.ThrowIfNull(commitActions);
-            foreach (var commitAction in commitActions)
+            this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+            ArgumentNullException.ThrowIfNull(enlistmentState);
+            foreach (var commitAction in enlistmentState.CommitActions)
             {
                 commitAction();
             }
 
-            this.commitDictionary.TryRemove(asyncTransaction, out _);
+            this.enlistmentStates.TryRemove(asyncTransaction, out _);
             enlistment.Done();
         }
 
@@ -8669,7 +9563,7 @@ namespace UnitTest.Slave
                 await this.asyncReaderWriterLock.EnterReadLockAsync(asyncTransaction.CancellationToken).ConfigureAwait(false);
                 asyncTransaction.ReadLocks.Add(this, this.asyncReaderWriterLock);
                 asyncTransaction.EnlistVolatile(this);
-                this.commitDictionary.TryAdd(asyncTransaction, new List<Action>());
+                this.enlistmentStates.TryAdd(asyncTransaction, new EnlistmentState());
             }
         }
 
@@ -8694,7 +9588,7 @@ namespace UnitTest.Slave
                     await this.asyncReaderWriterLock.EnterWriteLockAsync(asyncTransaction.CancellationToken).ConfigureAwait(false);
                     asyncTransaction.WriteLocks.Add(this, this.asyncReaderWriterLock);
                     asyncTransaction.EnlistVolatile(this);
-                    this.commitDictionary.TryAdd(asyncTransaction, new List<Action>());
+                    this.enlistmentStates.TryAdd(asyncTransaction, new EnlistmentState());
                 }
             }
         }
@@ -8767,6 +9661,8 @@ namespace UnitTest.Slave
         /// <returns>The patched <see cref="Model"/> rows.</returns>
         public async Task<(IEnumerable<Model> AddedRows, IEnumerable<Model> UpdatedRows)> PatchAsync(IEnumerable<Model> models)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var addedRows = new List<Model>();
             var updatedRows = new List<Model>();
             foreach (var model in models)
@@ -8774,21 +9670,32 @@ namespace UnitTest.Slave
                 if (this.dictionary.TryGetValue(model.ModelId, out var foundRow))
                 {
                     await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Model(foundRow);
+                    foundRow.ModelId = model.ModelId;
+                    foundRow.Name = model.Name;
+                    foundRow.RowVersion = model.RowVersion;
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        foundRow.ModelId = model.ModelId;
-                        foundRow.Name = model.Name;
-                        foundRow.RowVersion = model.RowVersion;
+                        foundRow.CopyFrom(originalRow);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Update, foundRow);
                     });
                     updatedRows.Add(foundRow);
                 }
                 else
                 {
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Model(model);
+                    this.fixture.RowVersion = model.RowVersion;
+                    this.dictionary.Add(model.ModelId, model);
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        this.fixture.RowVersion = model.RowVersion;
-                        this.dictionary.Add(model.ModelId, model);
+                        model.CopyFrom(originalRow);
+                        this.dictionary.Remove(model.ModelId);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Add, model);
                     });
                     addedRows.Add(model);
@@ -8811,24 +9718,37 @@ namespace UnitTest.Slave
         /// <returns>The added or updated <see cref="Model"/> row.</returns>
         public async Task<(Model? AddedRow, Model? UpdatedRow)> PutAsync(Model model)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue(model.ModelId, out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
-                this.CommitActions.Add(() =>
+                var originalRow = new Model(foundRow);
+                foundRow.ModelId = model.ModelId;
+                foundRow.Name = model.Name;
+                foundRow.RowVersion = model.RowVersion;
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    foundRow.ModelId = model.ModelId;
-                    foundRow.Name = model.Name;
-                    foundRow.RowVersion = model.RowVersion;
+                    foundRow.CopyFrom(originalRow);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Update, foundRow);
                 });
                 return (AddedRow: null, UpdatedRow: foundRow);
             }
             else
             {
-                this.CommitActions.Add(() =>
+                var originalRow = new Model(model);
+                this.fixture.RowVersion = model.RowVersion;
+                this.dictionary.Add(model.ModelId, model);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    this.fixture.RowVersion = model.RowVersion;
-                    this.dictionary.Add(model.ModelId, model);
+                    model.CopyFrom(originalRow);
+                    this.dictionary.Remove(model.ModelId);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Add, model);
                 });
                 return (AddedRow: model, UpdatedRow: null);
@@ -8842,16 +9762,25 @@ namespace UnitTest.Slave
         /// <returns>The removed <see cref="Model"/> rows.</returns>
         public async Task<IEnumerable<Model>> RemoveAsync(IEnumerable<Model> models)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var removedRows = new List<Model>();
             foreach (var model in models)
             {
                 if (this.dictionary.TryGetValue(model.ModelId, out var foundRow))
                 {
                     await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
-                    this.CommitActions.Add(() =>
+                    ConstraintException.ThrowIfTrue(foundRow.Accounts.Count != 0, "ModelAccountIndex");
+                    var originalRow = new Model(foundRow);
+                    foundRow.RowVersion = model.RowVersion;
+                    this.dictionary.Remove(foundRow.ModelId);
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        foundRow.RowVersion = model.RowVersion;
-                        this.dictionary.Remove(foundRow.ModelId);
+                        foundRow.CopyFrom(originalRow);
+                        this.dictionary.Add(foundRow.ModelId, foundRow);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.DeletedRows.AddFirst(foundRow);
                         this.OnRowChanged(DataAction.Remove, foundRow);
                     });
@@ -8869,13 +9798,22 @@ namespace UnitTest.Slave
         /// <returns>The removed <see cref="Model"/> row.</returns>
         public async Task<Model?> RemoveAsync(Model model)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue(model.ModelId, out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
-                this.CommitActions.Add(() =>
+                ConstraintException.ThrowIfTrue(foundRow.Accounts.Count != 0, "ModelAccountIndex");
+                var originalRow = new Model(foundRow);
+                foundRow.RowVersion = model.RowVersion;
+                this.dictionary.Remove(foundRow.ModelId);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    foundRow.RowVersion = model.RowVersion;
-                    this.dictionary.Remove(foundRow.ModelId);
+                    foundRow.CopyFrom(originalRow);
+                    this.dictionary.Add(foundRow.ModelId, foundRow);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.DeletedRows.AddFirst(foundRow);
                     this.OnRowChanged(DataAction.Remove, foundRow);
                 });
@@ -8890,6 +9828,16 @@ namespace UnitTest.Slave
         /// <inheritdoc/>
         public void Rollback(Enlistment enlistment)
         {
+            var asyncTransaction = AsyncTransaction.Current;
+            ArgumentNullException.ThrowIfNull(asyncTransaction);
+            this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+            ArgumentNullException.ThrowIfNull(enlistmentState);
+            foreach (var rollbackAction in enlistmentState.RollbackActions)
+            {
+                rollbackAction();
+            }
+
+            this.enlistmentStates.TryRemove(asyncTransaction, out _);
             enlistment.Done();
         }
 
@@ -8899,17 +9847,24 @@ namespace UnitTest.Slave
         /// <param name="models">The model row.</param>
         public async Task<IEnumerable<Model>> UpdateAsync(IEnumerable<Model> models)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var updatedRows = new List<Model>();
             foreach (var model in models)
             {
                 if (this.dictionary.TryGetValue(model.ModelId, out var foundRow))
                 {
                     await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Model(foundRow);
+                    foundRow.ModelId = model.ModelId;
+                    foundRow.Name = model.Name;
+                    foundRow.RowVersion = model.RowVersion;
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        foundRow.ModelId = model.ModelId;
-                        foundRow.Name = model.Name;
-                        foundRow.RowVersion = model.RowVersion;
+                        foundRow.CopyFrom(originalRow);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Update, foundRow);
                     });
                     updatedRows.Add(foundRow);
@@ -8929,14 +9884,21 @@ namespace UnitTest.Slave
         /// <param name="model">The model row.</param>
         public async Task<Model> UpdateAsync(Model model)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue(model.ModelId, out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
-                this.CommitActions.Add(() =>
+                var originalRow = new Model(foundRow);
+                foundRow.ModelId = model.ModelId;
+                foundRow.Name = model.Name;
+                foundRow.RowVersion = model.RowVersion;
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    foundRow.ModelId = model.ModelId;
-                    foundRow.Name = model.Name;
-                    foundRow.RowVersion = model.RowVersion;
+                    foundRow.CopyFrom(originalRow);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Update, foundRow);
                 });
                 return foundRow;
@@ -9016,7 +9978,7 @@ namespace UnitTest.Slave
         public long RowVersion { get; set; }
 
         /// <summary>
-        /// Shallow copy of a <see cref="Order"/> row.
+        /// Deep copy of a <see cref="Order"/> row.
         /// </summary>
         /// <param name="order">The destination <see cref="Order"/> row.</param>
         public void CopyFrom(Order order)
@@ -9093,14 +10055,14 @@ namespace UnitTest.Slave
         private readonly AsyncReaderWriterLock asyncReaderWriterLock = new AsyncReaderWriterLock();
 
         /// <summary>
-        /// The commit actions for all the concurrent transactions.
-        /// </summary>
-        private ConcurrentDictionary<AsyncTransaction, List<Action>> commitDictionary = new ConcurrentDictionary<AsyncTransaction, List<Action>>();
-
-        /// <summary>
         /// The primary index.
         /// </summary>
         private readonly Dictionary<(System.Guid, System.Guid), Order> dictionary = new Dictionary<(System.Guid, System.Guid), Order>();
+
+        /// <summary>
+        /// The enlistment states for all the concurrent transactions.
+        /// </summary>
+        private readonly ConcurrentDictionary<AsyncTransaction, EnlistmentState> enlistmentStates = new ConcurrentDictionary<AsyncTransaction, EnlistmentState>();
 
         /// <summary>
         /// The data model.
@@ -9113,29 +10075,27 @@ namespace UnitTest.Slave
         public event EventHandler<RowChangedEventArgs>? RowChanged;
 
         /// <summary>
-        /// Gets the commit actions for the current task.
+        /// Gets the list of deleted rows.
         /// </summary>
-        private List<Action> CommitActions
+        public LinkedList<Order> DeletedRows { get; } = new LinkedList<Order>();
+
+        /// <summary>
+        /// Gets the enlistment state for the current task.
+        /// </summary>
+        private EnlistmentState? EnlistmentState
         {
             get
             {
                 var asyncTransaction = AsyncTransaction.Current;
-                ArgumentNullException.ThrowIfNull(asyncTransaction);
-                if (asyncTransaction.CancellationToken.IsCancellationRequested)
+                if (asyncTransaction == null)
                 {
-                    throw new OperationCanceledException();
+                    return null;
                 }
 
-                this.commitDictionary.TryGetValue(asyncTransaction, out var commitActions);
-                ArgumentNullException.ThrowIfNull(commitActions);
-                return commitActions;
+                this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+                return enlistmentState;
             }
         }
-
-        /// <summary>
-        /// Gets the list of deleted rows.
-        /// </summary>
-        public LinkedList<Order> DeletedRows { get; } = new LinkedList<Order>();
 
         /// <summary>
         /// Adds a <see cref="Order"/> row.
@@ -9144,20 +10104,30 @@ namespace UnitTest.Slave
         /// <returns>The added <see cref="Order"/> row.</returns>
         public async Task<Order> AddAsync(Order order)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var addedAccount = this.fixture.Accounts.Find(order.AccountId);
-            ConstraintException.ThrowIfNull(addedAccount, "The action conflicted with the AccountOrderIndex constraint.");
+            ConstraintException.ThrowIfNull(addedAccount, "AccountOrderIndex");
             await addedAccount.EnterWriteLockAsync().ConfigureAwait(true);
             var addedAsset = this.fixture.Assets.Find(order.AssetId);
-            ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetOrderIndex constraint.");
+            ConstraintException.ThrowIfNull(addedAsset, "AssetOrderIndex");
             await addedAsset.EnterWriteLockAsync().ConfigureAwait(true);
-            this.CommitActions.Add(() =>
+            var originalRow = new Order(order);
+            order.Account = addedAccount;
+            order.Asset = addedAsset;
+            this.fixture.RowVersion = order.RowVersion;
+            addedAccount.Orders.Add(order);
+            addedAsset.Orders.Add(order);
+            this.dictionary.Add((order.AccountId, order.AssetId), order);
+            enlistmentState.RollbackActions.Add(() =>
             {
-                order.Account = addedAccount;
-                order.Asset = addedAsset;
-                this.fixture.RowVersion = order.RowVersion;
-                addedAccount.Orders.Add(order);
-                addedAsset.Orders.Add(order);
-                this.dictionary.Add((order.AccountId, order.AssetId), order);
+                order.CopyFrom(originalRow);
+                addedAccount.Orders.Remove(order);
+                addedAsset.Orders.Remove(order);
+                this.dictionary.Remove((order.AccountId, order.AssetId));
+            });
+            enlistmentState.CommitActions.Add(() =>
+            {
                 this.OnRowChanged(DataAction.Add, order);
             });
             return order;
@@ -9170,23 +10140,33 @@ namespace UnitTest.Slave
         /// <returns>The added <see cref="Order"/> rows.</returns>
         public async Task<IEnumerable<Order>> AddAsync(IEnumerable<Order> orders)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var addedRows = new List<Order>();
             foreach (var order in orders)
             {
                 var addedAccount = this.fixture.Accounts.Find(order.AccountId);
-                ConstraintException.ThrowIfNull(addedAccount, "The action conflicted with the AccountOrderIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAccount, "AccountOrderIndex");
                 await addedAccount.EnterWriteLockAsync().ConfigureAwait(true);
                 var addedAsset = this.fixture.Assets.Find(order.AssetId);
-                ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetOrderIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAsset, "AssetOrderIndex");
                 await addedAsset.EnterWriteLockAsync().ConfigureAwait(true);
-                this.CommitActions.Add(() =>
+                var originalRow = new Order(order);
+                order.Account = addedAccount;
+                order.Asset = addedAsset;
+                this.fixture.RowVersion = order.RowVersion;
+                addedAccount.Orders.Add(order);
+                addedAsset.Orders.Add(order);
+                this.dictionary.Add((order.AccountId, order.AssetId), order);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    order.Account = addedAccount;
-                    order.Asset = addedAsset;
-                    this.fixture.RowVersion = order.RowVersion;
-                    addedAccount.Orders.Add(order);
-                    addedAsset.Orders.Add(order);
-                    this.dictionary.Add((order.AccountId, order.AssetId), order);
+                    order.CopyFrom(originalRow);
+                    addedAccount.Orders.Remove(order);
+                    addedAsset.Orders.Remove(order);
+                    this.dictionary.Remove((order.AccountId, order.AssetId));
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Add, order);
                 });
                 addedRows.Add(order);
@@ -9200,14 +10180,14 @@ namespace UnitTest.Slave
         {
             var asyncTransaction = AsyncTransaction.Current;
             ArgumentNullException.ThrowIfNull(asyncTransaction);
-            this.commitDictionary.TryGetValue(asyncTransaction, out var commitActions);
-            ArgumentNullException.ThrowIfNull(commitActions);
-            foreach (var commitAction in commitActions)
+            this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+            ArgumentNullException.ThrowIfNull(enlistmentState);
+            foreach (var commitAction in enlistmentState.CommitActions)
             {
                 commitAction();
             }
 
-            this.commitDictionary.TryRemove(asyncTransaction, out _);
+            this.enlistmentStates.TryRemove(asyncTransaction, out _);
             enlistment.Done();
         }
 
@@ -9224,7 +10204,7 @@ namespace UnitTest.Slave
                 await this.asyncReaderWriterLock.EnterReadLockAsync(asyncTransaction.CancellationToken).ConfigureAwait(false);
                 asyncTransaction.ReadLocks.Add(this, this.asyncReaderWriterLock);
                 asyncTransaction.EnlistVolatile(this);
-                this.commitDictionary.TryAdd(asyncTransaction, new List<Action>());
+                this.enlistmentStates.TryAdd(asyncTransaction, new EnlistmentState());
             }
         }
 
@@ -9249,7 +10229,7 @@ namespace UnitTest.Slave
                     await this.asyncReaderWriterLock.EnterWriteLockAsync(asyncTransaction.CancellationToken).ConfigureAwait(false);
                     asyncTransaction.WriteLocks.Add(this, this.asyncReaderWriterLock);
                     asyncTransaction.EnlistVolatile(this);
-                    this.commitDictionary.TryAdd(asyncTransaction, new List<Action>());
+                    this.enlistmentStates.TryAdd(asyncTransaction, new EnlistmentState());
                 }
             }
         }
@@ -9294,7 +10274,7 @@ namespace UnitTest.Slave
                 var account = this.fixture.Accounts.Find(order.AccountId);
                 if (account == null)
                 {
-                    throw new ConstraintException("The insert action conflicted with the constraint AccountOrderIndex");
+                    throw new ConstraintException("AccountOrderIndex");
                 }
 
                 account.Orders.Add(order);
@@ -9302,7 +10282,7 @@ namespace UnitTest.Slave
                 var asset = this.fixture.Assets.Find(order.AssetId);
                 if (asset == null)
                 {
-                    throw new ConstraintException("The insert action conflicted with the constraint AssetOrderIndex");
+                    throw new ConstraintException("AssetOrderIndex");
                 }
 
                 asset.Orders.Add(order);
@@ -9339,6 +10319,8 @@ namespace UnitTest.Slave
         /// <returns>The patched <see cref="Order"/> rows.</returns>
         public async Task<(IEnumerable<Order> AddedRows, IEnumerable<Order> UpdatedRows)> PatchAsync(IEnumerable<Order> orders)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var addedRows = new List<Order>();
             var updatedRows = new List<Order>();
             foreach (var order in orders)
@@ -9353,23 +10335,32 @@ namespace UnitTest.Slave
                     ArgumentNullException.ThrowIfNull(removedAsset);
                     await removedAsset.EnterWriteLockAsync().ConfigureAwait(true);
                     var addedAccount = this.fixture.Accounts.Find(order.AccountId);
-                    ConstraintException.ThrowIfNull(addedAccount, "The action conflicted with the AccountOrderIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedAccount, "AccountOrderIndex");
                     await addedAccount.EnterWriteLockAsync().ConfigureAwait(true);
                     var addedAsset = this.fixture.Assets.Find(order.AssetId);
-                    ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetOrderIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedAsset, "AssetOrderIndex");
                     await addedAsset.EnterWriteLockAsync().ConfigureAwait(true);
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Order(foundRow);
+                    foundRow.Account = addedAccount;
+                    foundRow.AccountId = order.AccountId;
+                    foundRow.Asset = addedAsset;
+                    foundRow.AssetId = order.AssetId;
+                    foundRow.Quantity = order.Quantity;
+                    foundRow.RowVersion = order.RowVersion;
+                    removedAccount.Orders.Remove(foundRow);
+                    removedAsset.Orders.Remove(foundRow);
+                    addedAccount.Orders.Add(foundRow);
+                    addedAsset.Orders.Add(foundRow);
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        foundRow.Account = addedAccount;
-                        foundRow.AccountId = order.AccountId;
-                        foundRow.Asset = addedAsset;
-                        foundRow.AssetId = order.AssetId;
-                        foundRow.Quantity = order.Quantity;
-                        foundRow.RowVersion = order.RowVersion;
-                        removedAccount.Orders.Remove(order);
-                        removedAsset.Orders.Remove(order);
-                        addedAccount.Orders.Add(order);
-                        addedAsset.Orders.Add(order);
+                        foundRow.CopyFrom(originalRow);
+                        removedAccount.Orders.Add(foundRow);
+                        removedAsset.Orders.Add(foundRow);
+                        addedAccount.Orders.Remove(foundRow);
+                        addedAsset.Orders.Remove(foundRow);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Update, foundRow);
                     });
                     updatedRows.Add(foundRow);
@@ -9377,19 +10368,27 @@ namespace UnitTest.Slave
                 else
                 {
                     var addedAccount = this.fixture.Accounts.Find(order.AccountId);
-                    ConstraintException.ThrowIfNull(addedAccount, "The action conflicted with the AccountOrderIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedAccount, "AccountOrderIndex");
                     await addedAccount.EnterWriteLockAsync().ConfigureAwait(true);
                     var addedAsset = this.fixture.Assets.Find(order.AssetId);
-                    ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetOrderIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedAsset, "AssetOrderIndex");
                     await addedAsset.EnterWriteLockAsync().ConfigureAwait(true);
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Order(order);
+                    order.Account = addedAccount;
+                    order.Asset = addedAsset;
+                    this.fixture.RowVersion = order.RowVersion;
+                    addedAccount.Orders.Add(order);
+                    addedAsset.Orders.Add(order);
+                    this.dictionary.Add((order.AccountId, order.AssetId), order);
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        order.Account = addedAccount;
-                        order.Asset = addedAsset;
-                        this.fixture.RowVersion = order.RowVersion;
-                        addedAccount.Orders.Add(order);
-                        addedAsset.Orders.Add(order);
-                        this.dictionary.Add((order.AccountId, order.AssetId), order);
+                        order.CopyFrom(originalRow);
+                        addedAccount.Orders.Remove(order);
+                        addedAsset.Orders.Remove(order);
+                        this.dictionary.Remove((order.AccountId, order.AssetId));
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Add, order);
                     });
                     addedRows.Add(order);
@@ -9412,6 +10411,8 @@ namespace UnitTest.Slave
         /// <returns>The added or updated <see cref="Order"/> row.</returns>
         public async Task<(Order? AddedRow, Order? UpdatedRow)> PutAsync(Order order)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue((order.AccountId, order.AssetId), out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
@@ -9422,23 +10423,32 @@ namespace UnitTest.Slave
                 ArgumentNullException.ThrowIfNull(removedAsset);
                 await removedAsset.EnterWriteLockAsync().ConfigureAwait(true);
                 var addedAccount = this.fixture.Accounts.Find(order.AccountId);
-                ConstraintException.ThrowIfNull(addedAccount, "The action conflicted with the AccountOrderIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAccount, "AccountOrderIndex");
                 await addedAccount.EnterWriteLockAsync().ConfigureAwait(true);
                 var addedAsset = this.fixture.Assets.Find(order.AssetId);
-                ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetOrderIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAsset, "AssetOrderIndex");
                 await addedAsset.EnterWriteLockAsync().ConfigureAwait(true);
-                this.CommitActions.Add(() =>
+                var originalRow = new Order(foundRow);
+                foundRow.Account = addedAccount;
+                foundRow.AccountId = order.AccountId;
+                foundRow.Asset = addedAsset;
+                foundRow.AssetId = order.AssetId;
+                foundRow.Quantity = order.Quantity;
+                foundRow.RowVersion = order.RowVersion;
+                removedAccount.Orders.Remove(foundRow);
+                removedAsset.Orders.Remove(foundRow);
+                addedAccount.Orders.Add(foundRow);
+                addedAsset.Orders.Add(foundRow);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    foundRow.Account = addedAccount;
-                    foundRow.AccountId = order.AccountId;
-                    foundRow.Asset = addedAsset;
-                    foundRow.AssetId = order.AssetId;
-                    foundRow.Quantity = order.Quantity;
-                    foundRow.RowVersion = order.RowVersion;
-                    removedAccount.Orders.Remove(order);
-                    removedAsset.Orders.Remove(order);
-                    addedAccount.Orders.Add(order);
-                    addedAsset.Orders.Add(order);
+                    foundRow.CopyFrom(originalRow);
+                    removedAccount.Orders.Add(foundRow);
+                    removedAsset.Orders.Add(foundRow);
+                    addedAccount.Orders.Remove(foundRow);
+                    addedAsset.Orders.Remove(foundRow);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Update, foundRow);
                 });
                 return (AddedRow: null, UpdatedRow: foundRow);
@@ -9446,19 +10456,27 @@ namespace UnitTest.Slave
             else
             {
                 var addedAccount = this.fixture.Accounts.Find(order.AccountId);
-                ConstraintException.ThrowIfNull(addedAccount, "The action conflicted with the AccountOrderIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAccount, "AccountOrderIndex");
                 await addedAccount.EnterWriteLockAsync().ConfigureAwait(true);
                 var addedAsset = this.fixture.Assets.Find(order.AssetId);
-                ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetOrderIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAsset, "AssetOrderIndex");
                 await addedAsset.EnterWriteLockAsync().ConfigureAwait(true);
-                this.CommitActions.Add(() =>
+                var originalRow = new Order(order);
+                order.Account = addedAccount;
+                order.Asset = addedAsset;
+                this.fixture.RowVersion = order.RowVersion;
+                addedAccount.Orders.Add(order);
+                addedAsset.Orders.Add(order);
+                this.dictionary.Add((order.AccountId, order.AssetId), order);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    order.Account = addedAccount;
-                    order.Asset = addedAsset;
-                    this.fixture.RowVersion = order.RowVersion;
-                    addedAccount.Orders.Add(order);
-                    addedAsset.Orders.Add(order);
-                    this.dictionary.Add((order.AccountId, order.AssetId), order);
+                    order.CopyFrom(originalRow);
+                    addedAccount.Orders.Remove(order);
+                    addedAsset.Orders.Remove(order);
+                    this.dictionary.Remove((order.AccountId, order.AssetId));
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Add, order);
                 });
                 return (AddedRow: order, UpdatedRow: null);
@@ -9472,6 +10490,8 @@ namespace UnitTest.Slave
         /// <returns>The removed <see cref="Order"/> rows.</returns>
         public async Task<IEnumerable<Order>> RemoveAsync(IEnumerable<Order> orders)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var removedRows = new List<Order>();
             foreach (var order in orders)
             {
@@ -9484,14 +10504,22 @@ namespace UnitTest.Slave
                     var removedAsset = this.fixture.Assets.Find(order.AssetId);
                     ArgumentNullException.ThrowIfNull(removedAsset);
                     await removedAsset.EnterWriteLockAsync().ConfigureAwait(true);
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Order(foundRow);
+                    foundRow.Account = null;
+                    foundRow.Asset = null;
+                    foundRow.RowVersion = order.RowVersion;
+                    removedAccount.Orders.Remove(foundRow);
+                    removedAsset.Orders.Remove(foundRow);
+                    this.dictionary.Remove((foundRow.AccountId, foundRow.AssetId));
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        foundRow.Account = null;
-                        foundRow.Asset = null;
-                        foundRow.RowVersion = order.RowVersion;
-                        removedAccount.Orders.Remove(order);
-                        removedAsset.Orders.Remove(order);
-                        this.dictionary.Remove((foundRow.AccountId, foundRow.AssetId));
+                        foundRow.CopyFrom(originalRow);
+                        removedAccount.Orders.Add(foundRow);
+                        removedAsset.Orders.Add(foundRow);
+                        this.dictionary.Add((foundRow.AccountId, foundRow.AssetId), foundRow);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.DeletedRows.AddFirst(foundRow);
                         this.OnRowChanged(DataAction.Remove, foundRow);
                     });
@@ -9509,6 +10537,8 @@ namespace UnitTest.Slave
         /// <returns>The removed <see cref="Order"/> row.</returns>
         public async Task<Order?> RemoveAsync(Order order)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue((order.AccountId, order.AssetId), out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
@@ -9518,14 +10548,22 @@ namespace UnitTest.Slave
                 var removedAsset = this.fixture.Assets.Find(order.AssetId);
                 ArgumentNullException.ThrowIfNull(removedAsset);
                 await removedAsset.EnterWriteLockAsync().ConfigureAwait(true);
-                this.CommitActions.Add(() =>
+                var originalRow = new Order(foundRow);
+                foundRow.Account = null;
+                foundRow.Asset = null;
+                foundRow.RowVersion = order.RowVersion;
+                removedAccount.Orders.Remove(foundRow);
+                removedAsset.Orders.Remove(foundRow);
+                this.dictionary.Remove((foundRow.AccountId, foundRow.AssetId));
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    foundRow.Account = null;
-                    foundRow.Asset = null;
-                    foundRow.RowVersion = order.RowVersion;
-                    removedAccount.Orders.Remove(order);
-                    removedAsset.Orders.Remove(order);
-                    this.dictionary.Remove((foundRow.AccountId, foundRow.AssetId));
+                    foundRow.CopyFrom(originalRow);
+                    removedAccount.Orders.Add(foundRow);
+                    removedAsset.Orders.Add(foundRow);
+                    this.dictionary.Add((foundRow.AccountId, foundRow.AssetId), foundRow);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.DeletedRows.AddFirst(foundRow);
                     this.OnRowChanged(DataAction.Remove, foundRow);
                 });
@@ -9540,6 +10578,16 @@ namespace UnitTest.Slave
         /// <inheritdoc/>
         public void Rollback(Enlistment enlistment)
         {
+            var asyncTransaction = AsyncTransaction.Current;
+            ArgumentNullException.ThrowIfNull(asyncTransaction);
+            this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+            ArgumentNullException.ThrowIfNull(enlistmentState);
+            foreach (var rollbackAction in enlistmentState.RollbackActions)
+            {
+                rollbackAction();
+            }
+
+            this.enlistmentStates.TryRemove(asyncTransaction, out _);
             enlistment.Done();
         }
 
@@ -9549,6 +10597,8 @@ namespace UnitTest.Slave
         /// <param name="orders">The order row.</param>
         public async Task<IEnumerable<Order>> UpdateAsync(IEnumerable<Order> orders)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var updatedRows = new List<Order>();
             foreach (var order in orders)
             {
@@ -9562,23 +10612,32 @@ namespace UnitTest.Slave
                     ArgumentNullException.ThrowIfNull(removedAsset);
                     await removedAsset.EnterWriteLockAsync().ConfigureAwait(true);
                     var addedAccount = this.fixture.Accounts.Find(order.AccountId);
-                    ConstraintException.ThrowIfNull(addedAccount, "The action conflicted with the AccountOrderIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedAccount, "AccountOrderIndex");
                     await addedAccount.EnterWriteLockAsync().ConfigureAwait(true);
                     var addedAsset = this.fixture.Assets.Find(order.AssetId);
-                    ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetOrderIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedAsset, "AssetOrderIndex");
                     await addedAsset.EnterWriteLockAsync().ConfigureAwait(true);
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Order(foundRow);
+                    foundRow.Account = addedAccount;
+                    foundRow.AccountId = order.AccountId;
+                    foundRow.Asset = addedAsset;
+                    foundRow.AssetId = order.AssetId;
+                    foundRow.Quantity = order.Quantity;
+                    foundRow.RowVersion = order.RowVersion;
+                    removedAccount.Orders.Remove(foundRow);
+                    removedAsset.Orders.Remove(foundRow);
+                    addedAccount.Orders.Add(foundRow);
+                    addedAsset.Orders.Add(foundRow);
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        foundRow.Account = addedAccount;
-                        foundRow.AccountId = order.AccountId;
-                        foundRow.Asset = addedAsset;
-                        foundRow.AssetId = order.AssetId;
-                        foundRow.Quantity = order.Quantity;
-                        foundRow.RowVersion = order.RowVersion;
-                        removedAccount.Orders.Remove(order);
-                        removedAsset.Orders.Remove(order);
-                        addedAccount.Orders.Add(order);
-                        addedAsset.Orders.Add(order);
+                        foundRow.CopyFrom(originalRow);
+                        removedAccount.Orders.Add(foundRow);
+                        removedAsset.Orders.Add(foundRow);
+                        addedAccount.Orders.Remove(foundRow);
+                        addedAsset.Orders.Remove(foundRow);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Update, foundRow);
                     });
                     updatedRows.Add(foundRow);
@@ -9598,6 +10657,8 @@ namespace UnitTest.Slave
         /// <param name="order">The order row.</param>
         public async Task<Order> UpdateAsync(Order order)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue((order.AccountId, order.AssetId), out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
@@ -9608,23 +10669,32 @@ namespace UnitTest.Slave
                 ArgumentNullException.ThrowIfNull(removedAsset);
                 await removedAsset.EnterWriteLockAsync().ConfigureAwait(true);
                 var addedAccount = this.fixture.Accounts.Find(order.AccountId);
-                ConstraintException.ThrowIfNull(addedAccount, "The action conflicted with the AccountOrderIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAccount, "AccountOrderIndex");
                 await addedAccount.EnterWriteLockAsync().ConfigureAwait(true);
                 var addedAsset = this.fixture.Assets.Find(order.AssetId);
-                ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetOrderIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAsset, "AssetOrderIndex");
                 await addedAsset.EnterWriteLockAsync().ConfigureAwait(true);
-                this.CommitActions.Add(() =>
+                var originalRow = new Order(foundRow);
+                foundRow.Account = addedAccount;
+                foundRow.AccountId = order.AccountId;
+                foundRow.Asset = addedAsset;
+                foundRow.AssetId = order.AssetId;
+                foundRow.Quantity = order.Quantity;
+                foundRow.RowVersion = order.RowVersion;
+                removedAccount.Orders.Remove(foundRow);
+                removedAsset.Orders.Remove(foundRow);
+                addedAccount.Orders.Add(foundRow);
+                addedAsset.Orders.Add(foundRow);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    foundRow.Account = addedAccount;
-                    foundRow.AccountId = order.AccountId;
-                    foundRow.Asset = addedAsset;
-                    foundRow.AssetId = order.AssetId;
-                    foundRow.Quantity = order.Quantity;
-                    foundRow.RowVersion = order.RowVersion;
-                    removedAccount.Orders.Remove(order);
-                    removedAsset.Orders.Remove(order);
-                    addedAccount.Orders.Add(order);
-                    addedAsset.Orders.Add(order);
+                    foundRow.CopyFrom(originalRow);
+                    removedAccount.Orders.Add(foundRow);
+                    removedAsset.Orders.Add(foundRow);
+                    addedAccount.Orders.Remove(foundRow);
+                    addedAsset.Orders.Remove(foundRow);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Update, foundRow);
                 });
                 return foundRow;
@@ -9704,7 +10774,7 @@ namespace UnitTest.Slave
         public long RowVersion { get; set; }
 
         /// <summary>
-        /// Shallow copy of a <see cref="Position"/> row.
+        /// Deep copy of a <see cref="Position"/> row.
         /// </summary>
         /// <param name="position">The destination <see cref="Position"/> row.</param>
         public void CopyFrom(Position position)
@@ -9781,14 +10851,14 @@ namespace UnitTest.Slave
         private readonly AsyncReaderWriterLock asyncReaderWriterLock = new AsyncReaderWriterLock();
 
         /// <summary>
-        /// The commit actions for all the concurrent transactions.
-        /// </summary>
-        private ConcurrentDictionary<AsyncTransaction, List<Action>> commitDictionary = new ConcurrentDictionary<AsyncTransaction, List<Action>>();
-
-        /// <summary>
         /// The primary index.
         /// </summary>
         private readonly Dictionary<(System.Guid, System.Guid), Position> dictionary = new Dictionary<(System.Guid, System.Guid), Position>();
+
+        /// <summary>
+        /// The enlistment states for all the concurrent transactions.
+        /// </summary>
+        private readonly ConcurrentDictionary<AsyncTransaction, EnlistmentState> enlistmentStates = new ConcurrentDictionary<AsyncTransaction, EnlistmentState>();
 
         /// <summary>
         /// The data model.
@@ -9801,29 +10871,27 @@ namespace UnitTest.Slave
         public event EventHandler<RowChangedEventArgs>? RowChanged;
 
         /// <summary>
-        /// Gets the commit actions for the current task.
+        /// Gets the list of deleted rows.
         /// </summary>
-        private List<Action> CommitActions
+        public LinkedList<Position> DeletedRows { get; } = new LinkedList<Position>();
+
+        /// <summary>
+        /// Gets the enlistment state for the current task.
+        /// </summary>
+        private EnlistmentState? EnlistmentState
         {
             get
             {
                 var asyncTransaction = AsyncTransaction.Current;
-                ArgumentNullException.ThrowIfNull(asyncTransaction);
-                if (asyncTransaction.CancellationToken.IsCancellationRequested)
+                if (asyncTransaction == null)
                 {
-                    throw new OperationCanceledException();
+                    return null;
                 }
 
-                this.commitDictionary.TryGetValue(asyncTransaction, out var commitActions);
-                ArgumentNullException.ThrowIfNull(commitActions);
-                return commitActions;
+                this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+                return enlistmentState;
             }
         }
-
-        /// <summary>
-        /// Gets the list of deleted rows.
-        /// </summary>
-        public LinkedList<Position> DeletedRows { get; } = new LinkedList<Position>();
 
         /// <summary>
         /// Adds a <see cref="Position"/> row.
@@ -9832,20 +10900,30 @@ namespace UnitTest.Slave
         /// <returns>The added <see cref="Position"/> row.</returns>
         public async Task<Position> AddAsync(Position position)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var addedAccount = this.fixture.Accounts.Find(position.AccountId);
-            ConstraintException.ThrowIfNull(addedAccount, "The action conflicted with the AccountPositionIndex constraint.");
+            ConstraintException.ThrowIfNull(addedAccount, "AccountPositionIndex");
             await addedAccount.EnterWriteLockAsync().ConfigureAwait(true);
             var addedAsset = this.fixture.Assets.Find(position.AssetId);
-            ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetPositionIndex constraint.");
+            ConstraintException.ThrowIfNull(addedAsset, "AssetPositionIndex");
             await addedAsset.EnterWriteLockAsync().ConfigureAwait(true);
-            this.CommitActions.Add(() =>
+            var originalRow = new Position(position);
+            position.Account = addedAccount;
+            position.Asset = addedAsset;
+            this.fixture.RowVersion = position.RowVersion;
+            addedAccount.Positions.Add(position);
+            addedAsset.Positions.Add(position);
+            this.dictionary.Add((position.AccountId, position.AssetId), position);
+            enlistmentState.RollbackActions.Add(() =>
             {
-                position.Account = addedAccount;
-                position.Asset = addedAsset;
-                this.fixture.RowVersion = position.RowVersion;
-                addedAccount.Positions.Add(position);
-                addedAsset.Positions.Add(position);
-                this.dictionary.Add((position.AccountId, position.AssetId), position);
+                position.CopyFrom(originalRow);
+                addedAccount.Positions.Remove(position);
+                addedAsset.Positions.Remove(position);
+                this.dictionary.Remove((position.AccountId, position.AssetId));
+            });
+            enlistmentState.CommitActions.Add(() =>
+            {
                 this.OnRowChanged(DataAction.Add, position);
             });
             return position;
@@ -9858,23 +10936,33 @@ namespace UnitTest.Slave
         /// <returns>The added <see cref="Position"/> rows.</returns>
         public async Task<IEnumerable<Position>> AddAsync(IEnumerable<Position> positions)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var addedRows = new List<Position>();
             foreach (var position in positions)
             {
                 var addedAccount = this.fixture.Accounts.Find(position.AccountId);
-                ConstraintException.ThrowIfNull(addedAccount, "The action conflicted with the AccountPositionIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAccount, "AccountPositionIndex");
                 await addedAccount.EnterWriteLockAsync().ConfigureAwait(true);
                 var addedAsset = this.fixture.Assets.Find(position.AssetId);
-                ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetPositionIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAsset, "AssetPositionIndex");
                 await addedAsset.EnterWriteLockAsync().ConfigureAwait(true);
-                this.CommitActions.Add(() =>
+                var originalRow = new Position(position);
+                position.Account = addedAccount;
+                position.Asset = addedAsset;
+                this.fixture.RowVersion = position.RowVersion;
+                addedAccount.Positions.Add(position);
+                addedAsset.Positions.Add(position);
+                this.dictionary.Add((position.AccountId, position.AssetId), position);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    position.Account = addedAccount;
-                    position.Asset = addedAsset;
-                    this.fixture.RowVersion = position.RowVersion;
-                    addedAccount.Positions.Add(position);
-                    addedAsset.Positions.Add(position);
-                    this.dictionary.Add((position.AccountId, position.AssetId), position);
+                    position.CopyFrom(originalRow);
+                    addedAccount.Positions.Remove(position);
+                    addedAsset.Positions.Remove(position);
+                    this.dictionary.Remove((position.AccountId, position.AssetId));
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Add, position);
                 });
                 addedRows.Add(position);
@@ -9888,14 +10976,14 @@ namespace UnitTest.Slave
         {
             var asyncTransaction = AsyncTransaction.Current;
             ArgumentNullException.ThrowIfNull(asyncTransaction);
-            this.commitDictionary.TryGetValue(asyncTransaction, out var commitActions);
-            ArgumentNullException.ThrowIfNull(commitActions);
-            foreach (var commitAction in commitActions)
+            this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+            ArgumentNullException.ThrowIfNull(enlistmentState);
+            foreach (var commitAction in enlistmentState.CommitActions)
             {
                 commitAction();
             }
 
-            this.commitDictionary.TryRemove(asyncTransaction, out _);
+            this.enlistmentStates.TryRemove(asyncTransaction, out _);
             enlistment.Done();
         }
 
@@ -9912,7 +11000,7 @@ namespace UnitTest.Slave
                 await this.asyncReaderWriterLock.EnterReadLockAsync(asyncTransaction.CancellationToken).ConfigureAwait(false);
                 asyncTransaction.ReadLocks.Add(this, this.asyncReaderWriterLock);
                 asyncTransaction.EnlistVolatile(this);
-                this.commitDictionary.TryAdd(asyncTransaction, new List<Action>());
+                this.enlistmentStates.TryAdd(asyncTransaction, new EnlistmentState());
             }
         }
 
@@ -9937,7 +11025,7 @@ namespace UnitTest.Slave
                     await this.asyncReaderWriterLock.EnterWriteLockAsync(asyncTransaction.CancellationToken).ConfigureAwait(false);
                     asyncTransaction.WriteLocks.Add(this, this.asyncReaderWriterLock);
                     asyncTransaction.EnlistVolatile(this);
-                    this.commitDictionary.TryAdd(asyncTransaction, new List<Action>());
+                    this.enlistmentStates.TryAdd(asyncTransaction, new EnlistmentState());
                 }
             }
         }
@@ -9982,7 +11070,7 @@ namespace UnitTest.Slave
                 var account = this.fixture.Accounts.Find(position.AccountId);
                 if (account == null)
                 {
-                    throw new ConstraintException("The insert action conflicted with the constraint AccountPositionIndex");
+                    throw new ConstraintException("AccountPositionIndex");
                 }
 
                 account.Positions.Add(position);
@@ -9990,7 +11078,7 @@ namespace UnitTest.Slave
                 var asset = this.fixture.Assets.Find(position.AssetId);
                 if (asset == null)
                 {
-                    throw new ConstraintException("The insert action conflicted with the constraint AssetPositionIndex");
+                    throw new ConstraintException("AssetPositionIndex");
                 }
 
                 asset.Positions.Add(position);
@@ -10027,6 +11115,8 @@ namespace UnitTest.Slave
         /// <returns>The patched <see cref="Position"/> rows.</returns>
         public async Task<(IEnumerable<Position> AddedRows, IEnumerable<Position> UpdatedRows)> PatchAsync(IEnumerable<Position> positions)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var addedRows = new List<Position>();
             var updatedRows = new List<Position>();
             foreach (var position in positions)
@@ -10041,23 +11131,32 @@ namespace UnitTest.Slave
                     ArgumentNullException.ThrowIfNull(removedAsset);
                     await removedAsset.EnterWriteLockAsync().ConfigureAwait(true);
                     var addedAccount = this.fixture.Accounts.Find(position.AccountId);
-                    ConstraintException.ThrowIfNull(addedAccount, "The action conflicted with the AccountPositionIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedAccount, "AccountPositionIndex");
                     await addedAccount.EnterWriteLockAsync().ConfigureAwait(true);
                     var addedAsset = this.fixture.Assets.Find(position.AssetId);
-                    ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetPositionIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedAsset, "AssetPositionIndex");
                     await addedAsset.EnterWriteLockAsync().ConfigureAwait(true);
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Position(foundRow);
+                    foundRow.Account = addedAccount;
+                    foundRow.AccountId = position.AccountId;
+                    foundRow.Asset = addedAsset;
+                    foundRow.AssetId = position.AssetId;
+                    foundRow.Quantity = position.Quantity;
+                    foundRow.RowVersion = position.RowVersion;
+                    removedAccount.Positions.Remove(foundRow);
+                    removedAsset.Positions.Remove(foundRow);
+                    addedAccount.Positions.Add(foundRow);
+                    addedAsset.Positions.Add(foundRow);
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        foundRow.Account = addedAccount;
-                        foundRow.AccountId = position.AccountId;
-                        foundRow.Asset = addedAsset;
-                        foundRow.AssetId = position.AssetId;
-                        foundRow.Quantity = position.Quantity;
-                        foundRow.RowVersion = position.RowVersion;
-                        removedAccount.Positions.Remove(position);
-                        removedAsset.Positions.Remove(position);
-                        addedAccount.Positions.Add(position);
-                        addedAsset.Positions.Add(position);
+                        foundRow.CopyFrom(originalRow);
+                        removedAccount.Positions.Add(foundRow);
+                        removedAsset.Positions.Add(foundRow);
+                        addedAccount.Positions.Remove(foundRow);
+                        addedAsset.Positions.Remove(foundRow);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Update, foundRow);
                     });
                     updatedRows.Add(foundRow);
@@ -10065,19 +11164,27 @@ namespace UnitTest.Slave
                 else
                 {
                     var addedAccount = this.fixture.Accounts.Find(position.AccountId);
-                    ConstraintException.ThrowIfNull(addedAccount, "The action conflicted with the AccountPositionIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedAccount, "AccountPositionIndex");
                     await addedAccount.EnterWriteLockAsync().ConfigureAwait(true);
                     var addedAsset = this.fixture.Assets.Find(position.AssetId);
-                    ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetPositionIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedAsset, "AssetPositionIndex");
                     await addedAsset.EnterWriteLockAsync().ConfigureAwait(true);
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Position(position);
+                    position.Account = addedAccount;
+                    position.Asset = addedAsset;
+                    this.fixture.RowVersion = position.RowVersion;
+                    addedAccount.Positions.Add(position);
+                    addedAsset.Positions.Add(position);
+                    this.dictionary.Add((position.AccountId, position.AssetId), position);
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        position.Account = addedAccount;
-                        position.Asset = addedAsset;
-                        this.fixture.RowVersion = position.RowVersion;
-                        addedAccount.Positions.Add(position);
-                        addedAsset.Positions.Add(position);
-                        this.dictionary.Add((position.AccountId, position.AssetId), position);
+                        position.CopyFrom(originalRow);
+                        addedAccount.Positions.Remove(position);
+                        addedAsset.Positions.Remove(position);
+                        this.dictionary.Remove((position.AccountId, position.AssetId));
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Add, position);
                     });
                     addedRows.Add(position);
@@ -10100,6 +11207,8 @@ namespace UnitTest.Slave
         /// <returns>The added or updated <see cref="Position"/> row.</returns>
         public async Task<(Position? AddedRow, Position? UpdatedRow)> PutAsync(Position position)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue((position.AccountId, position.AssetId), out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
@@ -10110,23 +11219,32 @@ namespace UnitTest.Slave
                 ArgumentNullException.ThrowIfNull(removedAsset);
                 await removedAsset.EnterWriteLockAsync().ConfigureAwait(true);
                 var addedAccount = this.fixture.Accounts.Find(position.AccountId);
-                ConstraintException.ThrowIfNull(addedAccount, "The action conflicted with the AccountPositionIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAccount, "AccountPositionIndex");
                 await addedAccount.EnterWriteLockAsync().ConfigureAwait(true);
                 var addedAsset = this.fixture.Assets.Find(position.AssetId);
-                ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetPositionIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAsset, "AssetPositionIndex");
                 await addedAsset.EnterWriteLockAsync().ConfigureAwait(true);
-                this.CommitActions.Add(() =>
+                var originalRow = new Position(foundRow);
+                foundRow.Account = addedAccount;
+                foundRow.AccountId = position.AccountId;
+                foundRow.Asset = addedAsset;
+                foundRow.AssetId = position.AssetId;
+                foundRow.Quantity = position.Quantity;
+                foundRow.RowVersion = position.RowVersion;
+                removedAccount.Positions.Remove(foundRow);
+                removedAsset.Positions.Remove(foundRow);
+                addedAccount.Positions.Add(foundRow);
+                addedAsset.Positions.Add(foundRow);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    foundRow.Account = addedAccount;
-                    foundRow.AccountId = position.AccountId;
-                    foundRow.Asset = addedAsset;
-                    foundRow.AssetId = position.AssetId;
-                    foundRow.Quantity = position.Quantity;
-                    foundRow.RowVersion = position.RowVersion;
-                    removedAccount.Positions.Remove(position);
-                    removedAsset.Positions.Remove(position);
-                    addedAccount.Positions.Add(position);
-                    addedAsset.Positions.Add(position);
+                    foundRow.CopyFrom(originalRow);
+                    removedAccount.Positions.Add(foundRow);
+                    removedAsset.Positions.Add(foundRow);
+                    addedAccount.Positions.Remove(foundRow);
+                    addedAsset.Positions.Remove(foundRow);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Update, foundRow);
                 });
                 return (AddedRow: null, UpdatedRow: foundRow);
@@ -10134,19 +11252,27 @@ namespace UnitTest.Slave
             else
             {
                 var addedAccount = this.fixture.Accounts.Find(position.AccountId);
-                ConstraintException.ThrowIfNull(addedAccount, "The action conflicted with the AccountPositionIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAccount, "AccountPositionIndex");
                 await addedAccount.EnterWriteLockAsync().ConfigureAwait(true);
                 var addedAsset = this.fixture.Assets.Find(position.AssetId);
-                ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetPositionIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAsset, "AssetPositionIndex");
                 await addedAsset.EnterWriteLockAsync().ConfigureAwait(true);
-                this.CommitActions.Add(() =>
+                var originalRow = new Position(position);
+                position.Account = addedAccount;
+                position.Asset = addedAsset;
+                this.fixture.RowVersion = position.RowVersion;
+                addedAccount.Positions.Add(position);
+                addedAsset.Positions.Add(position);
+                this.dictionary.Add((position.AccountId, position.AssetId), position);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    position.Account = addedAccount;
-                    position.Asset = addedAsset;
-                    this.fixture.RowVersion = position.RowVersion;
-                    addedAccount.Positions.Add(position);
-                    addedAsset.Positions.Add(position);
-                    this.dictionary.Add((position.AccountId, position.AssetId), position);
+                    position.CopyFrom(originalRow);
+                    addedAccount.Positions.Remove(position);
+                    addedAsset.Positions.Remove(position);
+                    this.dictionary.Remove((position.AccountId, position.AssetId));
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Add, position);
                 });
                 return (AddedRow: position, UpdatedRow: null);
@@ -10160,6 +11286,8 @@ namespace UnitTest.Slave
         /// <returns>The removed <see cref="Position"/> rows.</returns>
         public async Task<IEnumerable<Position>> RemoveAsync(IEnumerable<Position> positions)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var removedRows = new List<Position>();
             foreach (var position in positions)
             {
@@ -10172,14 +11300,22 @@ namespace UnitTest.Slave
                     var removedAsset = this.fixture.Assets.Find(position.AssetId);
                     ArgumentNullException.ThrowIfNull(removedAsset);
                     await removedAsset.EnterWriteLockAsync().ConfigureAwait(true);
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Position(foundRow);
+                    foundRow.Account = null;
+                    foundRow.Asset = null;
+                    foundRow.RowVersion = position.RowVersion;
+                    removedAccount.Positions.Remove(foundRow);
+                    removedAsset.Positions.Remove(foundRow);
+                    this.dictionary.Remove((foundRow.AccountId, foundRow.AssetId));
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        foundRow.Account = null;
-                        foundRow.Asset = null;
-                        foundRow.RowVersion = position.RowVersion;
-                        removedAccount.Positions.Remove(position);
-                        removedAsset.Positions.Remove(position);
-                        this.dictionary.Remove((foundRow.AccountId, foundRow.AssetId));
+                        foundRow.CopyFrom(originalRow);
+                        removedAccount.Positions.Add(foundRow);
+                        removedAsset.Positions.Add(foundRow);
+                        this.dictionary.Add((foundRow.AccountId, foundRow.AssetId), foundRow);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.DeletedRows.AddFirst(foundRow);
                         this.OnRowChanged(DataAction.Remove, foundRow);
                     });
@@ -10197,6 +11333,8 @@ namespace UnitTest.Slave
         /// <returns>The removed <see cref="Position"/> row.</returns>
         public async Task<Position?> RemoveAsync(Position position)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue((position.AccountId, position.AssetId), out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
@@ -10206,14 +11344,22 @@ namespace UnitTest.Slave
                 var removedAsset = this.fixture.Assets.Find(position.AssetId);
                 ArgumentNullException.ThrowIfNull(removedAsset);
                 await removedAsset.EnterWriteLockAsync().ConfigureAwait(true);
-                this.CommitActions.Add(() =>
+                var originalRow = new Position(foundRow);
+                foundRow.Account = null;
+                foundRow.Asset = null;
+                foundRow.RowVersion = position.RowVersion;
+                removedAccount.Positions.Remove(foundRow);
+                removedAsset.Positions.Remove(foundRow);
+                this.dictionary.Remove((foundRow.AccountId, foundRow.AssetId));
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    foundRow.Account = null;
-                    foundRow.Asset = null;
-                    foundRow.RowVersion = position.RowVersion;
-                    removedAccount.Positions.Remove(position);
-                    removedAsset.Positions.Remove(position);
-                    this.dictionary.Remove((foundRow.AccountId, foundRow.AssetId));
+                    foundRow.CopyFrom(originalRow);
+                    removedAccount.Positions.Add(foundRow);
+                    removedAsset.Positions.Add(foundRow);
+                    this.dictionary.Add((foundRow.AccountId, foundRow.AssetId), foundRow);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.DeletedRows.AddFirst(foundRow);
                     this.OnRowChanged(DataAction.Remove, foundRow);
                 });
@@ -10228,6 +11374,16 @@ namespace UnitTest.Slave
         /// <inheritdoc/>
         public void Rollback(Enlistment enlistment)
         {
+            var asyncTransaction = AsyncTransaction.Current;
+            ArgumentNullException.ThrowIfNull(asyncTransaction);
+            this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+            ArgumentNullException.ThrowIfNull(enlistmentState);
+            foreach (var rollbackAction in enlistmentState.RollbackActions)
+            {
+                rollbackAction();
+            }
+
+            this.enlistmentStates.TryRemove(asyncTransaction, out _);
             enlistment.Done();
         }
 
@@ -10237,6 +11393,8 @@ namespace UnitTest.Slave
         /// <param name="positions">The position row.</param>
         public async Task<IEnumerable<Position>> UpdateAsync(IEnumerable<Position> positions)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var updatedRows = new List<Position>();
             foreach (var position in positions)
             {
@@ -10250,23 +11408,32 @@ namespace UnitTest.Slave
                     ArgumentNullException.ThrowIfNull(removedAsset);
                     await removedAsset.EnterWriteLockAsync().ConfigureAwait(true);
                     var addedAccount = this.fixture.Accounts.Find(position.AccountId);
-                    ConstraintException.ThrowIfNull(addedAccount, "The action conflicted with the AccountPositionIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedAccount, "AccountPositionIndex");
                     await addedAccount.EnterWriteLockAsync().ConfigureAwait(true);
                     var addedAsset = this.fixture.Assets.Find(position.AssetId);
-                    ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetPositionIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedAsset, "AssetPositionIndex");
                     await addedAsset.EnterWriteLockAsync().ConfigureAwait(true);
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Position(foundRow);
+                    foundRow.Account = addedAccount;
+                    foundRow.AccountId = position.AccountId;
+                    foundRow.Asset = addedAsset;
+                    foundRow.AssetId = position.AssetId;
+                    foundRow.Quantity = position.Quantity;
+                    foundRow.RowVersion = position.RowVersion;
+                    removedAccount.Positions.Remove(foundRow);
+                    removedAsset.Positions.Remove(foundRow);
+                    addedAccount.Positions.Add(foundRow);
+                    addedAsset.Positions.Add(foundRow);
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        foundRow.Account = addedAccount;
-                        foundRow.AccountId = position.AccountId;
-                        foundRow.Asset = addedAsset;
-                        foundRow.AssetId = position.AssetId;
-                        foundRow.Quantity = position.Quantity;
-                        foundRow.RowVersion = position.RowVersion;
-                        removedAccount.Positions.Remove(position);
-                        removedAsset.Positions.Remove(position);
-                        addedAccount.Positions.Add(position);
-                        addedAsset.Positions.Add(position);
+                        foundRow.CopyFrom(originalRow);
+                        removedAccount.Positions.Add(foundRow);
+                        removedAsset.Positions.Add(foundRow);
+                        addedAccount.Positions.Remove(foundRow);
+                        addedAsset.Positions.Remove(foundRow);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Update, foundRow);
                     });
                     updatedRows.Add(foundRow);
@@ -10286,6 +11453,8 @@ namespace UnitTest.Slave
         /// <param name="position">The position row.</param>
         public async Task<Position> UpdateAsync(Position position)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue((position.AccountId, position.AssetId), out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
@@ -10296,23 +11465,32 @@ namespace UnitTest.Slave
                 ArgumentNullException.ThrowIfNull(removedAsset);
                 await removedAsset.EnterWriteLockAsync().ConfigureAwait(true);
                 var addedAccount = this.fixture.Accounts.Find(position.AccountId);
-                ConstraintException.ThrowIfNull(addedAccount, "The action conflicted with the AccountPositionIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAccount, "AccountPositionIndex");
                 await addedAccount.EnterWriteLockAsync().ConfigureAwait(true);
                 var addedAsset = this.fixture.Assets.Find(position.AssetId);
-                ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetPositionIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAsset, "AssetPositionIndex");
                 await addedAsset.EnterWriteLockAsync().ConfigureAwait(true);
-                this.CommitActions.Add(() =>
+                var originalRow = new Position(foundRow);
+                foundRow.Account = addedAccount;
+                foundRow.AccountId = position.AccountId;
+                foundRow.Asset = addedAsset;
+                foundRow.AssetId = position.AssetId;
+                foundRow.Quantity = position.Quantity;
+                foundRow.RowVersion = position.RowVersion;
+                removedAccount.Positions.Remove(foundRow);
+                removedAsset.Positions.Remove(foundRow);
+                addedAccount.Positions.Add(foundRow);
+                addedAsset.Positions.Add(foundRow);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    foundRow.Account = addedAccount;
-                    foundRow.AccountId = position.AccountId;
-                    foundRow.Asset = addedAsset;
-                    foundRow.AssetId = position.AssetId;
-                    foundRow.Quantity = position.Quantity;
-                    foundRow.RowVersion = position.RowVersion;
-                    removedAccount.Positions.Remove(position);
-                    removedAsset.Positions.Remove(position);
-                    addedAccount.Positions.Add(position);
-                    addedAsset.Positions.Add(position);
+                    foundRow.CopyFrom(originalRow);
+                    removedAccount.Positions.Add(foundRow);
+                    removedAsset.Positions.Add(foundRow);
+                    addedAccount.Positions.Remove(foundRow);
+                    addedAsset.Positions.Remove(foundRow);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Update, foundRow);
                 });
                 return foundRow;
@@ -10378,7 +11556,7 @@ namespace UnitTest.Slave
         public long RowVersion { get; set; }
 
         /// <summary>
-        /// Shallow copy of a <see cref="Quote"/> row.
+        /// Deep copy of a <see cref="Quote"/> row.
         /// </summary>
         /// <param name="quote">The destination <see cref="Quote"/> row.</param>
         public void CopyFrom(Quote quote)
@@ -10453,14 +11631,14 @@ namespace UnitTest.Slave
         private readonly AsyncReaderWriterLock asyncReaderWriterLock = new AsyncReaderWriterLock();
 
         /// <summary>
-        /// The commit actions for all the concurrent transactions.
-        /// </summary>
-        private ConcurrentDictionary<AsyncTransaction, List<Action>> commitDictionary = new ConcurrentDictionary<AsyncTransaction, List<Action>>();
-
-        /// <summary>
         /// The primary index.
         /// </summary>
         private readonly Dictionary<System.Guid, Quote> dictionary = new Dictionary<System.Guid, Quote>();
+
+        /// <summary>
+        /// The enlistment states for all the concurrent transactions.
+        /// </summary>
+        private readonly ConcurrentDictionary<AsyncTransaction, EnlistmentState> enlistmentStates = new ConcurrentDictionary<AsyncTransaction, EnlistmentState>();
 
         /// <summary>
         /// The data model.
@@ -10473,29 +11651,27 @@ namespace UnitTest.Slave
         public event EventHandler<RowChangedEventArgs>? RowChanged;
 
         /// <summary>
-        /// Gets the commit actions for the current task.
+        /// Gets the list of deleted rows.
         /// </summary>
-        private List<Action> CommitActions
+        public LinkedList<Quote> DeletedRows { get; } = new LinkedList<Quote>();
+
+        /// <summary>
+        /// Gets the enlistment state for the current task.
+        /// </summary>
+        private EnlistmentState? EnlistmentState
         {
             get
             {
                 var asyncTransaction = AsyncTransaction.Current;
-                ArgumentNullException.ThrowIfNull(asyncTransaction);
-                if (asyncTransaction.CancellationToken.IsCancellationRequested)
+                if (asyncTransaction == null)
                 {
-                    throw new OperationCanceledException();
+                    return null;
                 }
 
-                this.commitDictionary.TryGetValue(asyncTransaction, out var commitActions);
-                ArgumentNullException.ThrowIfNull(commitActions);
-                return commitActions;
+                this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+                return enlistmentState;
             }
         }
-
-        /// <summary>
-        /// Gets the list of deleted rows.
-        /// </summary>
-        public LinkedList<Quote> DeletedRows { get; } = new LinkedList<Quote>();
 
         /// <summary>
         /// Adds a <see cref="Quote"/> row.
@@ -10504,15 +11680,24 @@ namespace UnitTest.Slave
         /// <returns>The added <see cref="Quote"/> row.</returns>
         public async Task<Quote> AddAsync(Quote quote)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var addedAsset = this.fixture.Assets.Find(quote.AssetId);
-            ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetQuoteIndex constraint.");
+            ConstraintException.ThrowIfNull(addedAsset, "AssetQuoteIndex");
             await addedAsset.EnterWriteLockAsync().ConfigureAwait(true);
-            this.CommitActions.Add(() =>
+            var originalRow = new Quote(quote);
+            quote.Asset = addedAsset;
+            this.fixture.RowVersion = quote.RowVersion;
+            addedAsset.Quotes.Add(quote);
+            this.dictionary.Add(quote.AssetId, quote);
+            enlistmentState.RollbackActions.Add(() =>
             {
-                quote.Asset = addedAsset;
-                this.fixture.RowVersion = quote.RowVersion;
-                addedAsset.Quotes.Add(quote);
-                this.dictionary.Add(quote.AssetId, quote);
+                quote.CopyFrom(originalRow);
+                addedAsset.Quotes.Remove(quote);
+                this.dictionary.Remove(quote.AssetId);
+            });
+            enlistmentState.CommitActions.Add(() =>
+            {
                 this.OnRowChanged(DataAction.Add, quote);
             });
             return quote;
@@ -10525,18 +11710,27 @@ namespace UnitTest.Slave
         /// <returns>The added <see cref="Quote"/> rows.</returns>
         public async Task<IEnumerable<Quote>> AddAsync(IEnumerable<Quote> quotes)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var addedRows = new List<Quote>();
             foreach (var quote in quotes)
             {
                 var addedAsset = this.fixture.Assets.Find(quote.AssetId);
-                ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetQuoteIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAsset, "AssetQuoteIndex");
                 await addedAsset.EnterWriteLockAsync().ConfigureAwait(true);
-                this.CommitActions.Add(() =>
+                var originalRow = new Quote(quote);
+                quote.Asset = addedAsset;
+                this.fixture.RowVersion = quote.RowVersion;
+                addedAsset.Quotes.Add(quote);
+                this.dictionary.Add(quote.AssetId, quote);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    quote.Asset = addedAsset;
-                    this.fixture.RowVersion = quote.RowVersion;
-                    addedAsset.Quotes.Add(quote);
-                    this.dictionary.Add(quote.AssetId, quote);
+                    quote.CopyFrom(originalRow);
+                    addedAsset.Quotes.Remove(quote);
+                    this.dictionary.Remove(quote.AssetId);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Add, quote);
                 });
                 addedRows.Add(quote);
@@ -10550,14 +11744,14 @@ namespace UnitTest.Slave
         {
             var asyncTransaction = AsyncTransaction.Current;
             ArgumentNullException.ThrowIfNull(asyncTransaction);
-            this.commitDictionary.TryGetValue(asyncTransaction, out var commitActions);
-            ArgumentNullException.ThrowIfNull(commitActions);
-            foreach (var commitAction in commitActions)
+            this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+            ArgumentNullException.ThrowIfNull(enlistmentState);
+            foreach (var commitAction in enlistmentState.CommitActions)
             {
                 commitAction();
             }
 
-            this.commitDictionary.TryRemove(asyncTransaction, out _);
+            this.enlistmentStates.TryRemove(asyncTransaction, out _);
             enlistment.Done();
         }
 
@@ -10574,7 +11768,7 @@ namespace UnitTest.Slave
                 await this.asyncReaderWriterLock.EnterReadLockAsync(asyncTransaction.CancellationToken).ConfigureAwait(false);
                 asyncTransaction.ReadLocks.Add(this, this.asyncReaderWriterLock);
                 asyncTransaction.EnlistVolatile(this);
-                this.commitDictionary.TryAdd(asyncTransaction, new List<Action>());
+                this.enlistmentStates.TryAdd(asyncTransaction, new EnlistmentState());
             }
         }
 
@@ -10599,7 +11793,7 @@ namespace UnitTest.Slave
                     await this.asyncReaderWriterLock.EnterWriteLockAsync(asyncTransaction.CancellationToken).ConfigureAwait(false);
                     asyncTransaction.WriteLocks.Add(this, this.asyncReaderWriterLock);
                     asyncTransaction.EnlistVolatile(this);
-                    this.commitDictionary.TryAdd(asyncTransaction, new List<Action>());
+                    this.enlistmentStates.TryAdd(asyncTransaction, new EnlistmentState());
                 }
             }
         }
@@ -10643,7 +11837,7 @@ namespace UnitTest.Slave
                 var asset = this.fixture.Assets.Find(quote.AssetId);
                 if (asset == null)
                 {
-                    throw new ConstraintException("The insert action conflicted with the constraint AssetQuoteIndex");
+                    throw new ConstraintException("AssetQuoteIndex");
                 }
 
                 asset.Quotes.Add(quote);
@@ -10680,6 +11874,8 @@ namespace UnitTest.Slave
         /// <returns>The patched <see cref="Quote"/> rows.</returns>
         public async Task<(IEnumerable<Quote> AddedRows, IEnumerable<Quote> UpdatedRows)> PatchAsync(IEnumerable<Quote> quotes)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var addedRows = new List<Quote>();
             var updatedRows = new List<Quote>();
             foreach (var quote in quotes)
@@ -10691,16 +11887,23 @@ namespace UnitTest.Slave
                     ArgumentNullException.ThrowIfNull(removedAsset);
                     await removedAsset.EnterWriteLockAsync().ConfigureAwait(true);
                     var addedAsset = this.fixture.Assets.Find(quote.AssetId);
-                    ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetQuoteIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedAsset, "AssetQuoteIndex");
                     await addedAsset.EnterWriteLockAsync().ConfigureAwait(true);
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Quote(foundRow);
+                    foundRow.Asset = addedAsset;
+                    foundRow.AssetId = quote.AssetId;
+                    foundRow.Last = quote.Last;
+                    foundRow.RowVersion = quote.RowVersion;
+                    removedAsset.Quotes.Remove(foundRow);
+                    addedAsset.Quotes.Add(foundRow);
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        foundRow.Asset = addedAsset;
-                        foundRow.AssetId = quote.AssetId;
-                        foundRow.Last = quote.Last;
-                        foundRow.RowVersion = quote.RowVersion;
-                        removedAsset.Quotes.Remove(quote);
-                        addedAsset.Quotes.Add(quote);
+                        foundRow.CopyFrom(originalRow);
+                        removedAsset.Quotes.Add(foundRow);
+                        addedAsset.Quotes.Remove(foundRow);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Update, foundRow);
                     });
                     updatedRows.Add(foundRow);
@@ -10708,14 +11911,21 @@ namespace UnitTest.Slave
                 else
                 {
                     var addedAsset = this.fixture.Assets.Find(quote.AssetId);
-                    ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetQuoteIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedAsset, "AssetQuoteIndex");
                     await addedAsset.EnterWriteLockAsync().ConfigureAwait(true);
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Quote(quote);
+                    quote.Asset = addedAsset;
+                    this.fixture.RowVersion = quote.RowVersion;
+                    addedAsset.Quotes.Add(quote);
+                    this.dictionary.Add(quote.AssetId, quote);
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        quote.Asset = addedAsset;
-                        this.fixture.RowVersion = quote.RowVersion;
-                        addedAsset.Quotes.Add(quote);
-                        this.dictionary.Add(quote.AssetId, quote);
+                        quote.CopyFrom(originalRow);
+                        addedAsset.Quotes.Remove(quote);
+                        this.dictionary.Remove(quote.AssetId);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Add, quote);
                     });
                     addedRows.Add(quote);
@@ -10738,6 +11948,8 @@ namespace UnitTest.Slave
         /// <returns>The added or updated <see cref="Quote"/> row.</returns>
         public async Task<(Quote? AddedRow, Quote? UpdatedRow)> PutAsync(Quote quote)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue(quote.AssetId, out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
@@ -10745,16 +11957,23 @@ namespace UnitTest.Slave
                 ArgumentNullException.ThrowIfNull(removedAsset);
                 await removedAsset.EnterWriteLockAsync().ConfigureAwait(true);
                 var addedAsset = this.fixture.Assets.Find(quote.AssetId);
-                ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetQuoteIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAsset, "AssetQuoteIndex");
                 await addedAsset.EnterWriteLockAsync().ConfigureAwait(true);
-                this.CommitActions.Add(() =>
+                var originalRow = new Quote(foundRow);
+                foundRow.Asset = addedAsset;
+                foundRow.AssetId = quote.AssetId;
+                foundRow.Last = quote.Last;
+                foundRow.RowVersion = quote.RowVersion;
+                removedAsset.Quotes.Remove(foundRow);
+                addedAsset.Quotes.Add(foundRow);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    foundRow.Asset = addedAsset;
-                    foundRow.AssetId = quote.AssetId;
-                    foundRow.Last = quote.Last;
-                    foundRow.RowVersion = quote.RowVersion;
-                    removedAsset.Quotes.Remove(quote);
-                    addedAsset.Quotes.Add(quote);
+                    foundRow.CopyFrom(originalRow);
+                    removedAsset.Quotes.Add(foundRow);
+                    addedAsset.Quotes.Remove(foundRow);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Update, foundRow);
                 });
                 return (AddedRow: null, UpdatedRow: foundRow);
@@ -10762,14 +11981,21 @@ namespace UnitTest.Slave
             else
             {
                 var addedAsset = this.fixture.Assets.Find(quote.AssetId);
-                ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetQuoteIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAsset, "AssetQuoteIndex");
                 await addedAsset.EnterWriteLockAsync().ConfigureAwait(true);
-                this.CommitActions.Add(() =>
+                var originalRow = new Quote(quote);
+                quote.Asset = addedAsset;
+                this.fixture.RowVersion = quote.RowVersion;
+                addedAsset.Quotes.Add(quote);
+                this.dictionary.Add(quote.AssetId, quote);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    quote.Asset = addedAsset;
-                    this.fixture.RowVersion = quote.RowVersion;
-                    addedAsset.Quotes.Add(quote);
-                    this.dictionary.Add(quote.AssetId, quote);
+                    quote.CopyFrom(originalRow);
+                    addedAsset.Quotes.Remove(quote);
+                    this.dictionary.Remove(quote.AssetId);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Add, quote);
                 });
                 return (AddedRow: quote, UpdatedRow: null);
@@ -10783,6 +12009,8 @@ namespace UnitTest.Slave
         /// <returns>The removed <see cref="Quote"/> rows.</returns>
         public async Task<IEnumerable<Quote>> RemoveAsync(IEnumerable<Quote> quotes)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var removedRows = new List<Quote>();
             foreach (var quote in quotes)
             {
@@ -10792,12 +12020,19 @@ namespace UnitTest.Slave
                     var removedAsset = this.fixture.Assets.Find(quote.AssetId);
                     ArgumentNullException.ThrowIfNull(removedAsset);
                     await removedAsset.EnterWriteLockAsync().ConfigureAwait(true);
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Quote(foundRow);
+                    foundRow.Asset = null;
+                    foundRow.RowVersion = quote.RowVersion;
+                    removedAsset.Quotes.Remove(foundRow);
+                    this.dictionary.Remove(foundRow.AssetId);
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        foundRow.Asset = null;
-                        foundRow.RowVersion = quote.RowVersion;
-                        removedAsset.Quotes.Remove(quote);
-                        this.dictionary.Remove(foundRow.AssetId);
+                        foundRow.CopyFrom(originalRow);
+                        removedAsset.Quotes.Add(foundRow);
+                        this.dictionary.Add(foundRow.AssetId, foundRow);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.DeletedRows.AddFirst(foundRow);
                         this.OnRowChanged(DataAction.Remove, foundRow);
                     });
@@ -10815,18 +12050,27 @@ namespace UnitTest.Slave
         /// <returns>The removed <see cref="Quote"/> row.</returns>
         public async Task<Quote?> RemoveAsync(Quote quote)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue(quote.AssetId, out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
                 var removedAsset = this.fixture.Assets.Find(quote.AssetId);
                 ArgumentNullException.ThrowIfNull(removedAsset);
                 await removedAsset.EnterWriteLockAsync().ConfigureAwait(true);
-                this.CommitActions.Add(() =>
+                var originalRow = new Quote(foundRow);
+                foundRow.Asset = null;
+                foundRow.RowVersion = quote.RowVersion;
+                removedAsset.Quotes.Remove(foundRow);
+                this.dictionary.Remove(foundRow.AssetId);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    foundRow.Asset = null;
-                    foundRow.RowVersion = quote.RowVersion;
-                    removedAsset.Quotes.Remove(quote);
-                    this.dictionary.Remove(foundRow.AssetId);
+                    foundRow.CopyFrom(originalRow);
+                    removedAsset.Quotes.Add(foundRow);
+                    this.dictionary.Add(foundRow.AssetId, foundRow);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.DeletedRows.AddFirst(foundRow);
                     this.OnRowChanged(DataAction.Remove, foundRow);
                 });
@@ -10841,6 +12085,16 @@ namespace UnitTest.Slave
         /// <inheritdoc/>
         public void Rollback(Enlistment enlistment)
         {
+            var asyncTransaction = AsyncTransaction.Current;
+            ArgumentNullException.ThrowIfNull(asyncTransaction);
+            this.enlistmentStates.TryGetValue(asyncTransaction, out var enlistmentState);
+            ArgumentNullException.ThrowIfNull(enlistmentState);
+            foreach (var rollbackAction in enlistmentState.RollbackActions)
+            {
+                rollbackAction();
+            }
+
+            this.enlistmentStates.TryRemove(asyncTransaction, out _);
             enlistment.Done();
         }
 
@@ -10850,6 +12104,8 @@ namespace UnitTest.Slave
         /// <param name="quotes">The quote row.</param>
         public async Task<IEnumerable<Quote>> UpdateAsync(IEnumerable<Quote> quotes)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             var updatedRows = new List<Quote>();
             foreach (var quote in quotes)
             {
@@ -10860,16 +12116,23 @@ namespace UnitTest.Slave
                     ArgumentNullException.ThrowIfNull(removedAsset);
                     await removedAsset.EnterWriteLockAsync().ConfigureAwait(true);
                     var addedAsset = this.fixture.Assets.Find(quote.AssetId);
-                    ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetQuoteIndex constraint.");
+                    ConstraintException.ThrowIfNull(addedAsset, "AssetQuoteIndex");
                     await addedAsset.EnterWriteLockAsync().ConfigureAwait(true);
-                    this.CommitActions.Add(() =>
+                    var originalRow = new Quote(foundRow);
+                    foundRow.Asset = addedAsset;
+                    foundRow.AssetId = quote.AssetId;
+                    foundRow.Last = quote.Last;
+                    foundRow.RowVersion = quote.RowVersion;
+                    removedAsset.Quotes.Remove(foundRow);
+                    addedAsset.Quotes.Add(foundRow);
+                    enlistmentState.RollbackActions.Add(() =>
                     {
-                        foundRow.Asset = addedAsset;
-                        foundRow.AssetId = quote.AssetId;
-                        foundRow.Last = quote.Last;
-                        foundRow.RowVersion = quote.RowVersion;
-                        removedAsset.Quotes.Remove(quote);
-                        addedAsset.Quotes.Add(quote);
+                        foundRow.CopyFrom(originalRow);
+                        removedAsset.Quotes.Add(foundRow);
+                        addedAsset.Quotes.Remove(foundRow);
+                    });
+                    enlistmentState.CommitActions.Add(() =>
+                    {
                         this.OnRowChanged(DataAction.Update, foundRow);
                     });
                     updatedRows.Add(foundRow);
@@ -10889,6 +12152,8 @@ namespace UnitTest.Slave
         /// <param name="quote">The quote row.</param>
         public async Task<Quote> UpdateAsync(Quote quote)
         {
+            var enlistmentState = this.EnlistmentState;
+            ArgumentNullException.ThrowIfNull(enlistmentState);
             if (this.dictionary.TryGetValue(quote.AssetId, out var foundRow))
             {
                 await foundRow.EnterWriteLockAsync().ConfigureAwait(true);
@@ -10896,16 +12161,23 @@ namespace UnitTest.Slave
                 ArgumentNullException.ThrowIfNull(removedAsset);
                 await removedAsset.EnterWriteLockAsync().ConfigureAwait(true);
                 var addedAsset = this.fixture.Assets.Find(quote.AssetId);
-                ConstraintException.ThrowIfNull(addedAsset, "The action conflicted with the AssetQuoteIndex constraint.");
+                ConstraintException.ThrowIfNull(addedAsset, "AssetQuoteIndex");
                 await addedAsset.EnterWriteLockAsync().ConfigureAwait(true);
-                this.CommitActions.Add(() =>
+                var originalRow = new Quote(foundRow);
+                foundRow.Asset = addedAsset;
+                foundRow.AssetId = quote.AssetId;
+                foundRow.Last = quote.Last;
+                foundRow.RowVersion = quote.RowVersion;
+                removedAsset.Quotes.Remove(foundRow);
+                addedAsset.Quotes.Add(foundRow);
+                enlistmentState.RollbackActions.Add(() =>
                 {
-                    foundRow.Asset = addedAsset;
-                    foundRow.AssetId = quote.AssetId;
-                    foundRow.Last = quote.Last;
-                    foundRow.RowVersion = quote.RowVersion;
-                    removedAsset.Quotes.Remove(quote);
-                    addedAsset.Quotes.Add(quote);
+                    foundRow.CopyFrom(originalRow);
+                    removedAsset.Quotes.Add(foundRow);
+                    addedAsset.Quotes.Remove(foundRow);
+                });
+                enlistmentState.CommitActions.Add(() =>
+                {
                     this.OnRowChanged(DataAction.Update, foundRow);
                 });
                 return foundRow;

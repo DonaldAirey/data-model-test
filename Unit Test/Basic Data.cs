@@ -46,7 +46,7 @@ namespace UnitTest
                 await fixture.Accounts.AddAsync(account);
 
                 // Commit the changes.
-                asyncTransaction.Complete();
+                asyncTransaction.Commit();
             }
 
             // Transaction to read the asset.
@@ -56,10 +56,10 @@ namespace UnitTest
                 await fixture.Accounts.EnterReadLockAsync();
 
                 // Validate the account data.
-                var foundAccount = fixture.Accounts.Find(BasicData.AccountId);
-                ArgumentNullException.ThrowIfNull(foundAccount);
-                await foundAccount.EnterReadLockAsync();
-                Assert.AreEqual(foundAccount.Name, BasicData.AccountName);
+                var foundRow = fixture.Accounts.Find(BasicData.AccountId);
+                ArgumentNullException.ThrowIfNull(foundRow);
+                await foundRow.EnterReadLockAsync();
+                Assert.AreEqual(foundRow.Name, BasicData.AccountName);
             }
         }
 
@@ -84,26 +84,25 @@ namespace UnitTest
                 await fixture.Accounts.EnterWriteLockAsync();
 
                 // Add the account.
-                await account.EnterWriteLockAsync();
                 await fixture.Accounts.AddAsync(account);
 
                 // Commit the changes.
-                asyncTransaction.Complete();
+                asyncTransaction.Commit();
             }
 
-            // Update the data.
+            // Attempt to update the data.
             using (var asyncTransaction = new AsyncTransaction())
             {
                 // Lock the table.
                 await fixture.Accounts.EnterReadLockAsync();
 
-                // Validate the account data.
+                // Update the account row.
                 var foundAccount = fixture.Accounts.Find(BasicData.AccountId);
                 ArgumentNullException.ThrowIfNull(foundAccount);
                 await foundAccount.EnterWriteLockAsync();
-                var cloneAccount = new Account(foundAccount);
-                cloneAccount.Name = "Some dumb name";
-                await fixture.Accounts.UpdateAsync(cloneAccount);
+                var clonedRow = new Account(foundAccount);
+                clonedRow.Name = "Some dumb name";
+                await fixture.Accounts.UpdateAsync(clonedRow);
 
                 // Should roll back here.
             }
